@@ -122,9 +122,10 @@ static CURRENT_TRACK_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(
 // A new play command supersedes any previous one via a monotonically increasing request_id.
 #[derive(Clone)]
 enum PendingPlayRequest {
-    Uri(String, i32),  // (uri, track_index)
-    Tracks(String),    // track_uris_json
-    Radio(String),     // seed_track_uri — re-resolves playlist and seeks to seed on retry
+    Uri(String, i32),        // (uri, track_index)
+    UriWithTrack(String, String), // (context_uri, track_uri)
+    Tracks(String),          // track_uris_json
+    Radio(String),           // seed_track_uri — re-resolves playlist and seeks to seed on retry
 }
 #[derive(Clone)]
 struct PendingPlay {
@@ -864,6 +865,13 @@ fn spawn_reconnection_loop() {
                                             match std::ffi::CString::new(uri.as_str()) {
                                                 Ok(cstr) => spotifly_play_uri(cstr.as_ptr(), *track_index),
                                                 Err(_) => return,
+                                            }
+                                        }
+                                        PendingPlayRequest::UriWithTrack(context_uri, track_uri) => {
+                                            debug!("Pending play watchdog: Playing never fired for {}/{} (id={}), re-issuing play_context_with_track", context_uri, track_uri, p.request_id);
+                                            match (std::ffi::CString::new(context_uri.as_str()), std::ffi::CString::new(track_uri.as_str())) {
+                                                (Ok(ctx), Ok(trk)) => spotifly_play_context_with_track(ctx.as_ptr(), trk.as_ptr()),
+                                                _ => return,
                                             }
                                         }
                                         PendingPlayRequest::Tracks(json) => {
@@ -2101,6 +2109,89 @@ pub extern "C" fn spotifly_play_uri(uri_or_url: *const c_char, track_index: i32)
                     IS_PLAYING.store(true, Ordering::SeqCst);
                     IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
                     set_pending_play(PendingPlayRequest::Uri(uri_str.clone(), track_index));
+                    0
+                }
+                Err(_e) => {
+                    debug!("Play error: Spirc.load() failed: {:?}", _e);
+                    -1
+                }
+            }
+        }
+        None => {
+            debug!("Play error: Spirc not initialized");
+            -1
+        }
+    }
+}
+
+/// Plays a context URI (playlist/album) starting at a specific track identified by URI.
+/// Use this instead of spotifly_play_uri with an index when tracks in the context may be
+/// interspersed with local files, to avoid index drift.
+/// @param context_uri Spotify URI of the context (e.g. "spotify:playlist:xxx")
+/// @param track_uri Spotify URI of the track to start at (e.g. "spotify:track:xxx")
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn spotifly_play_context_with_track(
+    context_uri: *const c_char,
+    track_uri: *const c_char,
+) -> i32 {
+    if context_uri.is_null() || track_uri.is_null() {
+        debug!("Play error: context_uri or track_uri is null");
+        return -1;
+    }
+
+    let ctx_str = unsafe {
+        match CStr::from_ptr(context_uri).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                debug!("Play error: invalid context_uri string");
+                return -1;
+            }
+        }
+    };
+
+    let trk_str = unsafe {
+        match CStr::from_ptr(track_uri).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                debug!("Play error: invalid track_uri string");
+                return -1;
+            }
+        }
+    };
+
+    debug!(
+        "spotifly_play_context_with_track called: context={}, track={}",
+        ctx_str, trk_str
+    );
+
+    if let Err(e) = require_session_connected() {
+        return e;
+    }
+
+    let spirc_guard = SPIRC.lock().unwrap();
+    match spirc_guard.as_ref() {
+        Some(spirc) => {
+            if let Err(e) = ensure_active_for_playback(spirc) {
+                return e;
+            }
+
+            let load_request = LoadRequest::from_context_uri(
+                ctx_str.clone(),
+                LoadRequestOptions {
+                    start_playing: true,
+                    seek_to: 0,
+                    playing_track: Some(PlayingTrack::Uri(trk_str.clone())),
+                    ..Default::default()
+                },
+            );
+
+            match spirc.load(load_request) {
+                Ok(_) => {
+                    debug!("Spirc.load() succeeded");
+                    IS_PLAYING.store(true, Ordering::SeqCst);
+                    IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                    set_pending_play(PendingPlayRequest::UriWithTrack(ctx_str, trk_str));
                     0
                 }
                 Err(_e) => {

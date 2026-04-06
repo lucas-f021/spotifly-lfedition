@@ -877,6 +877,23 @@ enum SpotifyPlayer {
         }
     }
 
+    /// Plays a context (playlist/album) starting at a specific track identified by URI.
+    /// Use this instead of play(uriOrUrl:trackIndex:) to avoid index drift caused by
+    /// local files interspersed in the context.
+    static func playContext(_ contextUri: String, trackUri: String) async throws {
+        let result = await Task.detached {
+            contextUri.withCString { ctxPtr in
+                trackUri.withCString { trkPtr in
+                    spotifly_play_context_with_track(ctxPtr, trkPtr)
+                }
+            }
+        }.value
+
+        guard result == 0 else {
+            throw SpotifyPlayerError.playbackFailed
+        }
+    }
+
     /// Plays a track by its Spotify track ID.
     @SpotifyAuthActor
     static func playTrack(trackId: String) async throws {

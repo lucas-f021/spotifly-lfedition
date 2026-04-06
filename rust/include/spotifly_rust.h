@@ -51,6 +51,13 @@ int32_t spotifly_play_tracks(const char* track_uris_json);
 /// Returns 0 on success, -1 on error.
 int32_t spotifly_play_uri(const char* uri_or_url, int32_t track_index);
 
+/// Plays a context URI starting at a specific track identified by track URI.
+/// Avoids index drift when local files are interspersed in the context.
+/// @param context_uri Spotify URI of the context (e.g., "spotify:playlist:xxx")
+/// @param track_uri Spotify URI of the track to start at (e.g., "spotify:track:xxx")
+/// Returns 0 on success, -1 on error.
+int32_t spotifly_play_context_with_track(const char* context_uri, const char* track_uri);
+
 /// Pauses playback.
 /// Returns 0 on success, -1 on error, -2 if session disconnected.
 int32_t spotifly_pause(void);

@@ -305,11 +305,11 @@ struct PlaylistDetailView: View {
             currentSection: .playlists,
             selectionId: playlistId,
             onDoubleTap: {
-                guard let uri = playlist?.uri else { return }
+                guard let playlistUri = playlist?.uri else { return }
                 let token = await session.validAccessToken()
-                await playbackViewModel.play(
-                    uriOrUrl: uri,
-                    trackIndex: index,
+                await playbackViewModel.playContext(
+                    playlistUri,
+                    trackUri: track.uri,
                     accessToken: token,
                 )
             },

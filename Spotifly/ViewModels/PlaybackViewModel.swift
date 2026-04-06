@@ -207,6 +207,31 @@ final class PlaybackViewModel {
         isLoading = false
     }
 
+    /// Plays a context (playlist/album) starting at a specific track identified by URI.
+    /// Avoids index drift caused by local files interspersed in the context.
+    func playContext(_ contextUri: String, trackUri: String, accessToken: String) async {
+        if !isInitialized {
+            await initializeIfNeeded(accessToken: accessToken)
+        }
+
+        guard isInitialized else {
+            errorMessage = "Player not initialized"
+            return
+        }
+
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            try await SpotifyPlayer.playContext(contextUri, trackUri: trackUri)
+            handlePlaybackStarted(trackId: trackUri)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+    }
+
     func playTrack(trackId: String, accessToken: String) async {
         await play(uriOrUrl: "spotify:track:\(trackId)", accessToken: accessToken)
     }
