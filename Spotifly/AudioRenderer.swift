@@ -81,7 +81,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
 
     // MARK: - Audio Format (cached)
 
-    private let formatDescription: CMAudioFormatDescription
+    private let formatDescription: CMAudioFormatDescription?
 
     // MARK: - Init
 
@@ -112,10 +112,12 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             extensions: nil,
             formatDescriptionOut: &desc,
         )
-        guard status == noErr, let formatDesc = desc else {
-            fatalError("AudioRenderer: Failed to create audio format description: \(status)")
+        if status == noErr, let formatDesc = desc {
+            formatDescription = formatDesc
+        } else {
+            debugLog("AudioRenderer", "Failed to create audio format description: \(status) — audio disabled")
+            formatDescription = nil
         }
-        formatDescription = formatDesc
         synchronizer.addRenderer(renderer)
 
         // Recover from output device changes (AirPlay ↔ local speaker)
@@ -225,6 +227,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
     }
 
     private func feedRenderer() {
+        guard formatDescription != nil else { return }
         while renderer.isReadyForMoreMediaData {
             // Read a chunk from ring buffer
             bufferLock.lock()
@@ -303,7 +306,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
                 allocator: kCFAllocatorDefault,
                 dataBuffer: block,
-                formatDescription: formatDescription,
+                formatDescription: formatDescription!,
                 sampleCount: frameCount,
                 presentationTimeStamp: currentPTS,
                 packetDescriptions: nil,

@@ -49,11 +49,10 @@ final class Equalizer: @unchecked Sendable {
     nonisolated(unsafe) private var delaysL: [[Float]]
     nonisolated(unsafe) private var delaysR: [[Float]]
 
-    /// Scratch buffers for deinterleaving (reused across calls)
-    nonisolated(unsafe) private var scratchL: [Float] = []
-    nonisolated(unsafe) private var scratchR: [Float] = []
-    /// Temp buffer for vDSP_biquad (needs separate in/out for exclusivity)
-    nonisolated(unsafe) private var tempBuf: [Float] = []
+    /// Scratch buffers for deinterleaving (raw pointers, reused across calls)
+    nonisolated(unsafe) private var scratchA: UnsafeMutablePointer<Float>?
+    nonisolated(unsafe) private var scratchB: UnsafeMutablePointer<Float>?
+    nonisolated(unsafe) private var scratchCapacity: Int = 0
 
     private nonisolated(unsafe) static let sampleRate: Float = 44100
     private nonisolated(unsafe) static let peakingQ: Float = 1.0
@@ -118,35 +117,41 @@ final class Equalizer: @unchecked Sendable {
         let frameCount = count / 2
 
         // Ensure scratch buffers are large enough
-        if scratchL.count < frameCount {
-            scratchL = [Float](repeating: 0, count: frameCount)
-            scratchR = [Float](repeating: 0, count: frameCount)
-            tempBuf = [Float](repeating: 0, count: frameCount)
+        if scratchCapacity < frameCount {
+            scratchA?.deallocate()
+            scratchB?.deallocate()
+            // Allocate two scratch buffers: A holds channel data, B is biquad output
+            scratchA = .allocate(capacity: frameCount * 2) // L and R contiguous
+            scratchB = .allocate(capacity: frameCount)
+            scratchCapacity = frameCount
         }
 
-        // Deinterleave: LRLRLR → L,L,L + R,R,R
-        var splitComplex = DSPSplitComplex(
-            realp: &scratchL,
-            imagp: &scratchR
-        )
-        let complexPtr = UnsafeRawPointer(ptr).assumingMemoryBound(to: DSPComplex.self)
-        vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(frameCount))
+        guard let scratchA, let scratchB else { return }
 
-        // Apply each biquad band using temp buffer to avoid exclusivity conflict
+        // L channel = scratchA[0..<frameCount], R channel = scratchA[frameCount..<frameCount*2]
+        let channelL = scratchA
+        let channelR = scratchA.advanced(by: frameCount)
+
+        // Deinterleave: LRLRLR → L,L,L + R,R,R
+        var split = DSPSplitComplex(realp: channelL, imagp: channelR)
+        let complexPtr = UnsafeRawPointer(ptr).assumingMemoryBound(to: DSPComplex.self)
+        vDSP_ctoz(complexPtr, 2, &split, 1, vDSP_Length(frameCount))
+
+        // Apply each biquad band — output to scratchB, then swap pointers
         for i in 0 ..< Self.bandCount {
             guard let setupL = setupsL[i], let setupR = setupsR[i] else { continue }
 
-            vDSP_biquad(setupL, &delaysL[i], &scratchL, 1, &tempBuf, 1, vDSP_Length(frameCount))
-            scratchL = tempBuf
+            vDSP_biquad(setupL, &delaysL[i], channelL, 1, scratchB, 1, vDSP_Length(frameCount))
+            memcpy(channelL, scratchB, frameCount * MemoryLayout<Float>.size)
 
-            vDSP_biquad(setupR, &delaysR[i], &scratchR, 1, &tempBuf, 1, vDSP_Length(frameCount))
-            scratchR = tempBuf
+            vDSP_biquad(setupR, &delaysR[i], channelR, 1, scratchB, 1, vDSP_Length(frameCount))
+            memcpy(channelR, scratchB, frameCount * MemoryLayout<Float>.size)
         }
 
         // Interleave back: L,L,L + R,R,R → LRLRLR
-        splitComplex = DSPSplitComplex(realp: &scratchL, imagp: &scratchR)
+        split = DSPSplitComplex(realp: channelL, imagp: channelR)
         let outComplex = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: DSPComplex.self)
-        vDSP_ztoc(&splitComplex, 1, outComplex, 2, vDSP_Length(frameCount))
+        vDSP_ztoc(&split, 1, outComplex, 2, vDSP_Length(frameCount))
     }
 
     // MARK: - Setup

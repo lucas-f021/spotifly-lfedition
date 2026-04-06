@@ -62,7 +62,7 @@ final class SpotifySession {
 
         if bufferDate < expirationDate {
             // Token still valid for 5+ minutes
-            debugLog("SpotifySession", "Returning valid token: \(accessToken)")
+            debugLog("SpotifySession", "Returning valid token: \(accessToken.prefix(20))...")
             return accessToken
         }
 
