@@ -947,6 +947,18 @@ final class PlaybackViewModel {
 
     /// Called every second to check for drift and sync state
     private func checkDriftAndSync() {
+        // Local file playback: sync position from LocalAudioPlayer
+        if isPlayingLocalFile {
+            let localPlayer = LocalAudioPlayer.shared
+            isPlaying = localPlayer.isPlaying
+            let posMs = UInt32(localPlayer.position * 1000)
+            positionAnchorMs = posMs
+            positionAnchorTime = CACurrentMediaTime()
+            currentPositionMs = posMs
+            trackDurationMs = UInt32(localPlayer.duration * 1000)
+            return
+        }
+
         var didCorrectDrift = false
 
         defer {

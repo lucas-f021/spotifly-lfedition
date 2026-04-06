@@ -369,6 +369,7 @@ struct ArtistDetailView: View {
             debugLog("ArtistDetailView", "fetchArtistTopTracks failed: \(error)")
         }
         isLoadingTopTracks = false
+        StoreCache.save(from: store)
     }
 
     private func loadReleases() async {
@@ -380,6 +381,7 @@ struct ArtistDetailView: View {
             group.addTask { await self.fetchSection(group: "compilation", token: token) }
         }
         isLoadingReleases = false
+        StoreCache.save(from: store)
     }
 
     private func fetchSection(group: String, token: String) async {

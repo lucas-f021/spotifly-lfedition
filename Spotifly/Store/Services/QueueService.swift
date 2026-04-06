@@ -92,9 +92,10 @@ final class QueueService {
 
         store.setQueue(previous: prevEntries, current: currentEntry, next: nextEntries, contextUri: notification.contextUri)
 
-        // Fetch track metadata for IDs not already in store
-        let allIds = prevEntries.map(\.trackId) + (currentEntry.map { [$0.trackId] } ?? []) + nextEntries.map(\.trackId)
-        fetchTrackMetadata(for: allIds)
+        // Queue display uses QueueItem data from Spirc (name, artist, image already included).
+        // Skip metadata fetch to avoid burning API quota — tracks get cached when
+        // the user opens the playlist/album instead.
+        updateNowPlayingMetadata()
     }
 
     private func scheduleQueueRefresh() {
@@ -143,9 +144,8 @@ final class QueueService {
             cancelPendingQueueRefresh()
         }
 
-        // Fetch track metadata for IDs not already in store
-        let allIds = (previousEntries ?? []).map(\.trackId) + (currentEntry.map { [$0.trackId] } ?? []) + nextEntries.map(\.trackId)
-        fetchTrackMetadata(for: allIds)
+        // Queue display uses QueueItem data from Spirc — skip metadata fetch.
+        updateNowPlayingMetadata()
     }
 
     // MARK: - Metadata Fetching
@@ -208,36 +208,29 @@ final class QueueService {
             return
         }
 
-        debugLog("QueueService", "Fetching \(stillNeeded.count) tracks from Web API")
+        debugLog("QueueService", "Fetching \(stillNeeded.count) tracks via spclient (rate-limited)")
 
-        metadataFetchTask = Task { [weak self, tokenProvider] in
+        metadataFetchTask = Task { [weak self] in
             guard let self else { return }
 
-            do {
-                let accessToken = await tokenProvider()
-                debugLog("QueueService", "Using token: \(String(accessToken.prefix(20)))...")
-                let trackData = try await SpotifyAPI.fetchTracks(accessToken: accessToken, trackIds: stillNeeded)
+            for trackId in stillNeeded {
+                guard !Task.isCancelled else { break }
+                // Skip local files
+                guard !trackId.hasPrefix("local:") else { continue }
+                // Skip if already fetched by another path (album load, playlist cache)
+                guard store.tracks[trackId] == nil else { continue }
 
-                guard !Task.isCancelled else { return }
-
-                // Convert APITrack to Track and store in the global store
-                let tracksToStore = trackData.values.map { Track(from: $0) }
-
-                // Store tracks in the global cache
-                store.upsertTracks(tracksToStore)
-
-                // Log each track's duration for debugging
-                for track in tracksToStore {
-                    debugLog("QueueService", "Cached track '\(track.name)' (\(track.id)): duration=\(track.durationMs)ms")
+                do {
+                    let apiTrack = try await SpotifyAPI.fetchTrackMetadataSpclient(trackId: trackId)
+                    let track = Track(from: apiTrack)
+                    store.upsertTrack(track)
+                } catch {
+                    debugLog("QueueService", "Failed to fetch track \(trackId): \(error)")
                 }
-                debugLog("QueueService", "Cached \(tracksToStore.count) tracks in store")
-
-                // Update queue items from store
-                updateNowPlayingMetadata()
-
-            } catch {
-                debugLog("QueueService", "Failed to fetch track metadata: \(error)")
             }
+
+            updateNowPlayingMetadata()
+            StoreCache.save(from: store)
         }
 
         _ = await metadataFetchTask?.value
@@ -282,15 +275,8 @@ final class QueueService {
 
             debugLog("QueueService", "Initial queue: current=\(currentEntry != nil ? 1 : 0), next=\(nextEntries.count)")
 
-            // Fetch track metadata
-            var allIds = (currentEntry.map { [$0.trackId] } ?? []) + nextEntries.map(\.trackId)
-
-            // Also add the track from playback state if different (shouldn't be, but just in case)
-            if let playbackTrack = playbackState?.item, !allIds.contains(playbackTrack.id) {
-                allIds.append(playbackTrack.id)
-            }
-
-            fetchTrackMetadata(for: allIds)
+            // Skip bulk metadata fetch — queue view uses QueueItem data directly.
+            updateNowPlayingMetadata()
 
             // Process playback state if available
             if let state = playbackState {

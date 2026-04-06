@@ -50,7 +50,7 @@ actor SpotifyRateLimiter {
         _waitingCount += 1
         defer { _waitingCount -= 1 }
 
-        while true {
+        for _ in 0 ..< 300 { // safety: max 300 iterations (~30s at 0.1s each)
             let now = Date()
             let windowStart = now.addingTimeInterval(-windowSeconds)
             timestamps.removeAll { $0 < windowStart }
@@ -62,8 +62,9 @@ actor SpotifyRateLimiter {
 
             // Wait until the oldest request exits the window
             let oldest = timestamps.first!
-            let delay = oldest.timeIntervalSince(windowStart)
-            try await Task.sleep(for: .seconds(max(delay, 0.1)))
+            let timeUntilExpiry = windowSeconds - now.timeIntervalSince(oldest)
+            let delay = max(min(timeUntilExpiry, 2.0), 0.1) // clamp between 0.1s and 2s
+            try await Task.sleep(for: .seconds(delay))
         }
     }
 

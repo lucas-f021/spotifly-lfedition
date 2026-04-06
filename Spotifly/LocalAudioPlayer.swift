@@ -19,9 +19,9 @@ final class LocalAudioPlayer {
     private(set) var duration: Double = 0 // seconds
     private(set) var position: Double = 0 // seconds
 
-    private let engine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
-    private let eq = AVAudioUnitEQ(numberOfBands: Equalizer.bandCount)
+    private var engine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var eq: AVAudioUnitEQ?
     private var audioFile: AVAudioFile?
     private var positionTimer: Timer?
     /// Sample rate of the current file (for position calculation)
@@ -29,22 +29,27 @@ final class LocalAudioPlayer {
     /// Frame position when playback last started/resumed
     private var startingFrame: AVAudioFramePosition = 0
 
-    private init() {
-        setupEngine()
-        syncEQFromEqualizer()
-    }
+    private init() {}
 
     // MARK: - Engine Setup
 
-    private func setupEngine() {
-        engine.attach(playerNode)
-        engine.attach(eq)
-        // Chain: playerNode → EQ → mainMixer → output
-        // Format will be connected per-file in play()
+    /// Lazily creates the audio engine on first use.
+    private func ensureEngine() {
+        guard engine == nil else { return }
+        let e = AVAudioEngine()
+        let p = AVAudioPlayerNode()
+        let q = AVAudioUnitEQ(numberOfBands: Equalizer.bandCount)
+        e.attach(p)
+        e.attach(q)
+        engine = e
+        playerNode = p
+        eq = q
+        syncEQFromEqualizer()
     }
 
     /// Syncs AVAudioUnitEQ bands from the app's Equalizer (shared via AudioRenderer).
     func syncEQFromEqualizer() {
+        guard let eq else { return }
         let equalizer = sharedEqualizer
         let enabled = equalizer.isEnabled
 
@@ -73,6 +78,9 @@ final class LocalAudioPlayer {
     /// Plays a local audio file.
     func play(url: URL) throws {
         stop()
+        ensureEngine()
+
+        guard let engine, let playerNode, let eq else { return }
 
         let file = try AVAudioFile(forReading: url)
         audioFile = file
@@ -97,7 +105,7 @@ final class LocalAudioPlayer {
 
     /// Resumes playback if paused.
     func resume() {
-        guard !isPlaying, audioFile != nil else { return }
+        guard !isPlaying, audioFile != nil, let playerNode else { return }
         playerNode.play()
         isPlaying = true
         startPositionTimer()
@@ -105,18 +113,21 @@ final class LocalAudioPlayer {
 
     /// Pauses playback.
     func pause() {
-        playerNode.pause()
+        playerNode?.pause()
         isPlaying = false
         stopPositionTimer()
     }
 
     /// Stops playback and resets state.
     func stop() {
-        playerNode.stop()
-        engine.stop()
-        // Disconnect to allow reconnecting with different format
-        engine.disconnectNodeOutput(playerNode)
-        engine.disconnectNodeOutput(eq)
+        playerNode?.stop()
+        engine?.stop()
+        if let playerNode { engine?.disconnectNodeOutput(playerNode) }
+        if let eq { engine?.disconnectNodeOutput(eq) }
+        // Release the engine to free CoreAudio resources
+        engine = nil
+        playerNode = nil
+        eq = nil
         audioFile = nil
         isPlaying = false
         currentFileURL = nil
@@ -128,7 +139,7 @@ final class LocalAudioPlayer {
 
     /// Seeks to a position in seconds.
     func seek(to seconds: Double) {
-        guard let file = audioFile else { return }
+        guard let file = audioFile, let playerNode else { return }
 
         let wasPlaying = isPlaying
         playerNode.stop()
@@ -158,7 +169,7 @@ final class LocalAudioPlayer {
 
     /// Sets volume (0.0–1.0).
     func setVolume(_ volume: Float) {
-        playerNode.volume = volume
+        playerNode?.volume = volume
     }
 
     // MARK: - Position Timer
@@ -178,7 +189,8 @@ final class LocalAudioPlayer {
     }
 
     private func updatePosition() {
-        guard isPlaying, let nodeTime = playerNode.lastRenderTime,
+        guard isPlaying, let playerNode,
+              let nodeTime = playerNode.lastRenderTime,
               let playerTime = playerNode.playerTime(forNodeTime: nodeTime)
         else { return }
 

@@ -165,9 +165,9 @@ struct SidebarView: View {
 struct RateLimiterStatusView: View {
     @State private var snap = RateLimiterSnapshot(requestsInWindow: 0, maxRequests: 27, windowSeconds: 30, oldestRequestAge: nil, newestRequestAge: nil, waitingCount: 0)
 
-    /// Seconds until the window fully resets (newest request exits)
+    /// Seconds until the oldest request exits the window (next slot frees up)
     private var resetIn: Double? {
-        guard let age = snap.newestRequestAge else { return nil }
+        guard let age = snap.oldestRequestAge else { return nil }
         let remaining = snap.windowSeconds - age
         return remaining > 0 ? remaining : nil
     }
