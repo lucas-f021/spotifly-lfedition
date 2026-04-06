@@ -3182,6 +3182,28 @@ pub extern "C" fn spotifly_get_track_metadata(track_id: *const c_char) -> *mut c
 /// Returns lightweight stubs (URI + ID only) for all tracks in a playlist.
 /// No SpTrack::get calls — returns instantly with ~0 extra RAM.
 /// Swift fetches full metadata on demand per-row as the user scrolls.
+/// Simple percent-decoding (%XX → char)
+fn percent_decode_simple(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                result.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
 async fn fetch_playlist_tracks_via_spclient(
     session: &Session,
     playlist_id: &str,
@@ -3203,10 +3225,61 @@ async fn fetch_playlist_tracks_via_spclient(
     let mut items: Vec<serde_json::Value> = Vec::new();
     for uri in &track_uris {
         let uri_str = uri.to_uri();
-        // Skip local files — they can't be fetched via SpTrack::get
+
         if uri_str.starts_with("spotify:local:") {
+            // Local files: parse metadata from URI
+            // Format: spotify:local:Artist:Album:Track:DurationSeconds
+            // Fields are URL-encoded (+ for spaces, %XX for special chars)
+            let parts: Vec<&str> = uri_str.splitn(6, ':').collect();
+            let (artist, album, name, duration_secs) = if parts.len() == 6 {
+                let decode = |s: &str| -> String {
+                    // Decode + as space, then percent-encoded chars
+                    let plus_decoded = s.replace('+', " ");
+                    percent_decode_simple(&plus_decoded)
+                };
+                (
+                    decode(parts[2]),
+                    decode(parts[3]),
+                    decode(parts[4]),
+                    parts[5].parse::<i64>().unwrap_or(0),
+                )
+            } else {
+                ("Unknown".to_string(), "".to_string(), "Local File".to_string(), 0i64)
+            };
+
+            // Use a stable hash of the URI as the ID (local files have no Spotify ID)
+            let local_id = format!("local:{:x}", {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                uri_str.hash(&mut h);
+                h.finish()
+            });
+
+            let track = serde_json::json!({
+                "id": local_id,
+                "name": name,
+                "uri": uri_str,
+                "duration_ms": duration_secs * 1000,
+                "track_number": null,
+                "disc_number": null,
+                "artists": [{"id": "", "name": artist, "uri": ""}],
+                "album": {
+                    "id": "",
+                    "name": album,
+                    "uri": "",
+                    "images": [],
+                    "artists": []
+                },
+                "external_urls": {}
+            });
+
+            items.push(serde_json::json!({
+                "added_at": null,
+                "track": track
+            }));
             continue;
         }
+
         let id = uri.to_id();
 
         // Stub: only id and uri, rest is placeholder.

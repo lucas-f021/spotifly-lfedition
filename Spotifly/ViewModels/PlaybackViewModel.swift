@@ -57,6 +57,9 @@ final class PlaybackViewModel {
     var currentTrackUri: String?
     var errorMessage: String?
 
+    /// Whether the currently playing track is a local file (not Spirc)
+    private(set) var isPlayingLocalFile = false
+
     /// Returns the URI of the currently playing track (alias for currentTrackUri)
     var currentlyPlayingURI: String? {
         currentTrackUri
@@ -283,10 +286,52 @@ final class PlaybackViewModel {
         // Queue update will come via Mercury callback
     }
 
+    // MARK: - Local File Playback
+
+    /// Plays a local audio file, pausing any active Spirc playback.
+    func playLocalFile(_ track: Track) {
+        guard track.isLocalFile else { return }
+
+        let localFileManager = LocalFileManager.shared
+        guard let fileURL = localFileManager.findFile(for: track) else {
+            errorMessage = "Local file not found. Set your music folder in Preferences."
+            return
+        }
+
+        // Stop Spirc playback if active
+        if SpotifyPlayer.isActiveDevice {
+            SpotifyPlayer.pause()
+        }
+
+        let localPlayer = LocalAudioPlayer.shared
+        do {
+            try localPlayer.play(url: fileURL)
+            isPlayingLocalFile = true
+            currentTrackUri = track.uri
+            isPlaying = true
+            trackDurationMs = UInt32(localPlayer.duration * 1000)
+            positionAnchorMs = 0
+            positionAnchorTime = CACurrentMediaTime()
+            currentPositionMs = 0
+            errorMessage = nil
+            updateNowPlayingInfo()
+        } catch {
+            errorMessage = "Failed to play local file: \(error.localizedDescription)"
+        }
+    }
+
+    /// Stops local file playback (called before switching to Spirc).
+    private func stopLocalPlayback() {
+        guard isPlayingLocalFile else { return }
+        LocalAudioPlayer.shared.stop()
+        isPlayingLocalFile = false
+    }
+
     // MARK: - Playback State Helpers
 
     /// Common setup after playback has started
     private func handlePlaybackStarted(trackId: String) {
+        stopLocalPlayback()
         currentTrackUri = trackId
         isPlaying = true
         // Apply volume after playback starts (mixer is now initialized)
@@ -311,6 +356,7 @@ final class PlaybackViewModel {
     }
 
     func stop() {
+        stopLocalPlayback()
         SpotifyPlayer.stop()
         isPlaying = false
         currentTrackUri = nil
@@ -390,6 +436,11 @@ final class PlaybackViewModel {
     }
 
     func pause() {
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.pause()
+            isPlaying = false
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             // During reconnection, session may not be fully connected yet
             guard SpotifyPlayer.isSessionConnected else {
@@ -412,6 +463,13 @@ final class PlaybackViewModel {
     }
 
     func resume() {
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.resume()
+            isPlaying = true
+            positionAnchorTime = CACurrentMediaTime()
+            positionAnchorMs = UInt32(LocalAudioPlayer.shared.position * 1000)
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             // During reconnection, session may not be fully connected yet
             guard SpotifyPlayer.isSessionConnected else {
@@ -689,6 +747,10 @@ final class PlaybackViewModel {
 
     /// Perform the actual seek operation (called after debouncing)
     private func performSeek(to positionMs: UInt32) {
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.seek(to: Double(positionMs) / 1000.0)
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             SpotifyPlayer.seek(positionMs: positionMs)
         } else {
@@ -1003,7 +1065,9 @@ final class PlaybackViewModel {
             .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] newVolume in
                 guard let self, isInitialized else { return }
-                if SpotifyPlayer.isActiveDevice {
+                if isPlayingLocalFile {
+                    LocalAudioPlayer.shared.setVolume(Float(newVolume))
+                } else if SpotifyPlayer.isActiveDevice {
                     SpotifyPlayer.setVolume(newVolume)
                 } else {
                     let percent = Int((newVolume * 100).rounded())

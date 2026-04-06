@@ -497,13 +497,17 @@ struct PlaylistDetailView: View {
                 currentSection: .playlists,
                 selectionId: playlistId,
                 onDoubleTap: {
-                    guard let playlistUri = playlist?.uri else { return }
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.playContext(
-                        playlistUri,
-                        trackUri: track.uri,
-                        accessToken: token,
-                    )
+                    if track.isLocalFile {
+                        playbackViewModel.playLocalFile(track)
+                    } else {
+                        guard let playlistUri = playlist?.uri else { return }
+                        let token = await session.validAccessToken()
+                        await playbackViewModel.playContext(
+                            playlistUri,
+                            trackUri: track.uri,
+                            accessToken: token,
+                        )
+                    }
                 },
             )
 

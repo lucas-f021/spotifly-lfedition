@@ -104,8 +104,14 @@ struct TrackRow: View {
             }
             .frame(width: 30, alignment: showTrackNumber ? .trailing : .center)
 
-            // Album art (if available)
-            if let url = track.images.url(for: 40, scale: displayScale) {
+            // Album art
+            if track.isLocalFile {
+                Image(systemName: "music.note")
+                    .font(.caption)
+                    .frame(width: 40, height: 40)
+                    .background(Color.gray.opacity(0.2))
+                    .cornerRadius(4)
+            } else if let url = track.images.url(for: 40, scale: displayScale) {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .empty:
@@ -141,6 +147,14 @@ struct TrackRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+
+            // Local file indicator
+            if track.isLocalFile {
+                Image(systemName: "internaldrive")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .help("Local file")
             }
 
             // Provider indicator (Q=queue, C=context, A=autoplay)

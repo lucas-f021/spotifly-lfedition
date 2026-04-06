@@ -85,8 +85,10 @@ actor SpotifyRateLimiter {
 }
 
 /// Single shared rate limiter for ALL Spotify requests (Web API + spclient).
-/// Spotify enforces 30 req / 30s in dev mode across the entire app — we use 27 for headroom.
-let spotifyRateLimiter = SpotifyRateLimiter(maxRequests: 27, windowSeconds: 30)
+/// Spotify enforces 30 req / 30s in dev mode across the entire app.
+/// We use 20 to leave headroom — spclient calls (SpTrack::get) may make multiple
+/// internal HTTP requests that we can't track from Swift.
+let spotifyRateLimiter = SpotifyRateLimiter(maxRequests: 20, windowSeconds: 30)
 
 // MARK: - Spotify API
 

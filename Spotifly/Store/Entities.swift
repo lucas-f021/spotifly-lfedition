@@ -81,7 +81,12 @@ struct Track: Identifiable, Sendable, Hashable, Codable {
 
     /// Whether this track is a stub (only has id/uri, metadata not yet loaded)
     var isStub: Bool {
-        name.isEmpty
+        name.isEmpty && !isLocalFile
+    }
+
+    /// Whether this track is a local file (not on Spotify's servers)
+    var isLocalFile: Bool {
+        uri.hasPrefix("spotify:local:")
     }
 
     var durationFormatted: String {
