@@ -125,10 +125,8 @@ struct PlaylistDetailView: View {
             }
             await loadTracks()
 
-            // If pinned, pre-fetch all stubs in background
-            if isCached {
-                await prefetchAllMetadata()
-            }
+            // Pre-fetch all stubs in background (auto-caches to disk)
+            await prefetchAllMetadata()
         }
         .onChange(of: playlistId) {
             if let playlist {
@@ -349,8 +347,7 @@ struct PlaylistDetailView: View {
             ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
                 trackRowView(track: track, index: index)
                     .task(id: track.id) {
-                        // Cached playlists prefetch all tracks — skip per-row fetches
-                        guard !isCached else { return }
+                        // Fetch metadata for visible stubs (prefetch handles the rest in background)
                         await fetchMetadataIfNeeded(for: track)
                     }
 
@@ -659,6 +656,7 @@ struct PlaylistDetailView: View {
                 playlistId: playlistId,
                 accessToken: token,
             )
+            StoreCache.save(from: store)
         } catch {
             errorMessage = error.localizedDescription
         }

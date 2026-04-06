@@ -11,7 +11,7 @@ import Foundation
 
 // MARK: - Cache Limits
 
-private let maxCacheBytes = 4 * 1024 * 1024 // 4MB
+private let maxCacheBytes = 5 * 1024 * 1024 // 5MB
 
 // MARK: - Cache File Location
 

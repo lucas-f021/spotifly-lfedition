@@ -35,8 +35,9 @@ struct Queue {
 
 // MARK: - Cache TTLs (shared with StoreCache)
 
-let libraryTTL: TimeInterval = 24 * 60 * 60
-let favoritesTTL: TimeInterval = 60 * 60
+let libraryTTL: TimeInterval = 7 * 24 * 60 * 60  // 7 days
+let favoritesTTL: TimeInterval = 24 * 60 * 60     // 24 hours
+let tracksTTL: TimeInterval = .infinity            // never expire
 
 // MARK: - App Store
 
@@ -599,7 +600,7 @@ final class AppStore {
 
     /// Applies a loaded cache snapshot to the store. Only applies sections that are not expired.
     func applyCache(_ snapshot: CacheSnapshot) {
-        if let section = snapshot.tracks, !section.isExpired(ttl: libraryTTL) {
+        if let section = snapshot.tracks, !section.isExpired(ttl: tracksTTL) {
             let nonStubs = section.data.filter { !$0.value.isStub }
             tracks.merge(nonStubs) { _, new in new }
         }
