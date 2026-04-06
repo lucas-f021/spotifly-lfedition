@@ -369,6 +369,14 @@ void spotifly_set_initial_volume(uint16_t volume);
 /// @param playlist_id Spotify playlist ID (22-character base62 string, NOT a full URI)
 char* spotifly_get_playlist_tracks_spclient(const char* playlist_id);
 
+/// Fetches full metadata for a single track via spclient (SpTrack::get).
+/// Returns a JSON string matching TrackCodable format, or NULL on error.
+///
+/// IMPORTANT: The caller must free the returned string with spotifly_free_string().
+///
+/// @param track_id Spotify track ID (22-character base62 string, NOT a full URI)
+char* spotifly_get_track_metadata(const char* track_id);
+
 #ifdef __cplusplus
 }
 #endif

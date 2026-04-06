@@ -297,6 +297,7 @@ extension SpotifyAPI {
     /// Used as fallback when the Web API returns 403 (dev-mode app restriction).
     static func fetchPlaylistTracksSpclient(playlistId: String) async throws -> [APITrack] {
         debugLog("SpotifyAPI", "[spclient] fetching tracks for playlist \(playlistId)")
+        try await spotifyRateLimiter.wait()
 
         // Call the blocking Rust FFI on a background thread to avoid holding the cooperative thread pool
         let json: String = try await withCheckedThrowingContinuation { continuation in
@@ -325,5 +326,31 @@ extension SpotifyAPI {
         } catch {
             throw SpotifyAPIError.invalidResponse
         }
+    }
+
+    /// Fetches full metadata for a single track via spclient (SpTrack::get).
+    /// Used for on-demand loading as playlist rows become visible.
+    /// Gated by the spclient rate limiter to avoid 429s.
+    static func fetchTrackMetadataSpclient(trackId: String) async throws -> APITrack {
+        try await spotifyRateLimiter.wait()
+
+        let json: String = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let rawPtr = spotifly_get_track_metadata(trackId) else {
+                    continuation.resume(throwing: SpotifyAPIError.apiError("spclient returned no data for track \(trackId)"))
+                    return
+                }
+                let result = String(cString: rawPtr)
+                spotifly_free_string(rawPtr)
+                continuation.resume(returning: result)
+            }
+        }
+
+        guard let data = json.data(using: .utf8) else {
+            throw SpotifyAPIError.invalidResponse
+        }
+
+        let decoded = try JSONDecoder().decode(TrackCodable.self, from: data)
+        return decoded.toAPITrack()
     }
 }

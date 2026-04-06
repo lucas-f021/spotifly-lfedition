@@ -131,9 +131,13 @@ final class AlbumService {
 
     /// Get tracks for an album (from store or fetch)
     func getAlbumTracks(albumId: String, accessToken: String) async throws -> [Track] {
-        // Check if tracks are already loaded
+        // Check if tracks are already loaded and all present in the store
         if let album = store.albums[albumId], album.tracksLoaded {
-            return album.trackIds.compactMap { store.tracks[$0] }
+            let resolved = album.trackIds.compactMap { store.tracks[$0] }
+            // Re-fetch if some tracks are missing (e.g. evicted by playlist LRU)
+            if resolved.count == album.trackIds.count {
+                return resolved
+            }
         }
 
         // Prevent concurrent fetches for the same album

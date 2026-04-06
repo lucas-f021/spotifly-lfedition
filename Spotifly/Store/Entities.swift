@@ -79,6 +79,11 @@ struct Track: Identifiable, Sendable, Hashable, Codable {
     let albumName: String?
     let images: ImageSet
 
+    /// Whether this track is a stub (only has id/uri, metadata not yet loaded)
+    var isStub: Bool {
+        name.isEmpty
+    }
+
     var durationFormatted: String {
         formatTrackTime(milliseconds: durationMs)
     }

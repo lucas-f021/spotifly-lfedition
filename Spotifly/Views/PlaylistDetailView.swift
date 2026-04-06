@@ -53,9 +53,25 @@ struct PlaylistDetailView: View {
     }
 
     /// Tracks from the store for this playlist
+    /// Returns all tracks for this playlist. Tracks not yet in the store
+    /// (evicted by LRU or not yet fetched) are represented as stubs.
     private var tracks: [Track] {
         guard let storedPlaylist = store.playlists[playlistId] else { return [] }
-        return storedPlaylist.trackIds.compactMap { store.tracks[$0] }
+        return storedPlaylist.trackIds.map { id in
+            store.tracks[id] ?? Track(
+                id: id,
+                name: "",
+                uri: "spotify:track:\(id)",
+                durationMs: 0,
+                trackNumber: nil,
+                externalUrl: nil,
+                albumId: nil,
+                artistId: nil,
+                artistName: "",
+                albumName: nil,
+                images: .empty,
+            )
+        }
     }
 
     /// Whether the current user owns this playlist
@@ -278,10 +294,24 @@ struct PlaylistDetailView: View {
         }
     }
 
+    /// Set of track IDs currently being fetched (prevents duplicate requests)
+    @State private var fetchingTrackIds: Set<String> = []
+    /// LRU order of track IDs with loaded metadata (most recent at end)
+    @State private var metadataLRU: [String] = []
+    /// Max number of tracks to keep full metadata for — evict beyond this
+    private let metadataCacheLimit = 50
+
     private var normalTrackList: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
                 trackRowView(track: track, index: index)
+                    .task(id: track.id) {
+                        await fetchMetadataIfNeeded(for: track)
+                    }
+                    .onDisappear {
+                        // No-op: eviction happens on fetch, not on disappear,
+                        // to avoid thrashing during fast scrolling
+                    }
 
                 if index < tracks.count - 1 {
                     Divider()
@@ -295,52 +325,134 @@ struct PlaylistDetailView: View {
         .padding(.bottom, 100)
     }
 
+    /// Fetches full metadata for a stub track on demand, evicting old entries if over the limit.
+    private func fetchMetadataIfNeeded(for track: Track) async {
+        // Touch LRU even for non-stubs (already loaded) to keep them fresh
+        if !track.isStub {
+            touchLRU(track.id)
+            return
+        }
+        guard !fetchingTrackIds.contains(track.id) else { return }
+
+        fetchingTrackIds.insert(track.id)
+        defer { fetchingTrackIds.remove(track.id) }
+
+        do {
+            let apiTrack = try await SpotifyAPI.fetchTrackMetadataSpclient(trackId: track.id)
+            let fullTrack = Track(from: apiTrack)
+            store.upsertTrack(fullTrack)
+            touchLRU(track.id)
+            evictIfNeeded()
+        } catch {
+            debugLog("PlaylistDetailView", "Failed to fetch metadata for \(track.id): \(error)")
+        }
+    }
+
+    /// Moves a track ID to the end of the LRU list (most recently used).
+    private func touchLRU(_ trackId: String) {
+        metadataLRU.removeAll { $0 == trackId }
+        metadataLRU.append(trackId)
+    }
+
+    /// Evicts the oldest metadata entries when over the cache limit.
+    /// Skips tracks referenced by albums, other playlists, or favorites to avoid breaking other views.
+    private func evictIfNeeded() {
+        // Build set of track IDs that are protected (used outside this playlist)
+        var protectedIds = Set<String>()
+        for (id, album) in store.albums where album.tracksLoaded {
+            protectedIds.formUnion(album.trackIds)
+        }
+        for (id, playlist) in store.playlists where id != playlistId {
+            protectedIds.formUnion(playlist.trackIds)
+        }
+        protectedIds.formUnion(store.favoriteTrackIds)
+        protectedIds.formUnion(store.savedTrackIds)
+
+        while metadataLRU.count > metadataCacheLimit {
+            let evictId = metadataLRU.removeFirst()
+            // Never evict tracks used by other views
+            guard !protectedIds.contains(evictId) else { continue }
+            store.removeTrack(evictId)
+        }
+    }
+
     @ViewBuilder
     private func trackRowView(track: Track, index: Int) -> some View {
-        let row = TrackRow(
-            track: track,
-            index: index,
-            currentlyPlayingURI: playbackViewModel.currentlyPlayingURI,
-            playbackViewModel: playbackViewModel,
-            currentSection: .playlists,
-            selectionId: playlistId,
-            onDoubleTap: {
-                guard let playlistUri = playlist?.uri else { return }
-                let token = await session.validAccessToken()
-                await playbackViewModel.playContext(
-                    playlistUri,
-                    trackUri: track.uri,
-                    accessToken: token,
-                )
-            },
-        )
-
-        if isOwner {
-            row
-                .opacity(draggedTrackId == track.id ? 0.5 : 1.0)
-                .onDrag {
-                    draggedTrackId = track.id
-                    // Capture original index BEFORE any optimistic updates
-                    if let playlist = store.playlists[playlistId] {
-                        draggedFromIndex = playlist.trackIds.firstIndex(of: track.id)
-                    }
-                    return NSItemProvider(object: track.id as NSString)
-                }
-                .onDrop(
-                    of: [.text],
-                    delegate: PlaylistReorderDropDelegate(
-                        targetTrackId: track.id,
-                        playlistId: playlistId,
-                        draggedTrackId: $draggedTrackId,
-                        draggedFromIndex: $draggedFromIndex,
-                        store: store,
-                        playlistService: playlistService,
-                        session: session,
-                    ),
-                )
+        if track.isStub {
+            stubTrackRow(index: index)
         } else {
-            row
+            let row = TrackRow(
+                track: track,
+                index: index,
+                currentlyPlayingURI: playbackViewModel.currentlyPlayingURI,
+                playbackViewModel: playbackViewModel,
+                currentSection: .playlists,
+                selectionId: playlistId,
+                onDoubleTap: {
+                    guard let playlistUri = playlist?.uri else { return }
+                    let token = await session.validAccessToken()
+                    await playbackViewModel.playContext(
+                        playlistUri,
+                        trackUri: track.uri,
+                        accessToken: token,
+                    )
+                },
+            )
+
+            if isOwner {
+                row
+                    .opacity(draggedTrackId == track.id ? 0.5 : 1.0)
+                    .onDrag {
+                        draggedTrackId = track.id
+                        // Capture original index BEFORE any optimistic updates
+                        if let playlist = store.playlists[playlistId] {
+                            draggedFromIndex = playlist.trackIds.firstIndex(of: track.id)
+                        }
+                        return NSItemProvider(object: track.id as NSString)
+                    }
+                    .onDrop(
+                        of: [.text],
+                        delegate: PlaylistReorderDropDelegate(
+                            targetTrackId: track.id,
+                            playlistId: playlistId,
+                            draggedTrackId: $draggedTrackId,
+                            draggedFromIndex: $draggedFromIndex,
+                            store: store,
+                            playlistService: playlistService,
+                            session: session,
+                        ),
+                    )
+            } else {
+                row
+            }
         }
+    }
+
+    /// Placeholder row shown while track metadata is loading
+    private func stubTrackRow(index: Int) -> some View {
+        HStack(spacing: 12) {
+            Text("\(index + 1)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .center)
+
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.gray.opacity(0.15))
+                .frame(width: 40, height: 40)
+
+            VStack(alignment: .leading, spacing: 4) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.gray.opacity(0.15))
+                    .frame(width: 140, height: 12)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.gray.opacity(0.1))
+                    .frame(width: 90, height: 10)
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
     }
 
     private func deletePlaylist() {

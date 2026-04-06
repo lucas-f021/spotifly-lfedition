@@ -133,27 +133,107 @@ struct SidebarView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            Button {
-                selection = .profile
-            } label: {
-                HStack(spacing: 8) {
-                    ProfileAvatarView(userProfile: userProfile, size: 28)
-                    Text(userProfile?.displayName ?? String(localized: "nav.profile"))
-                        .lineLimit(1)
-                    Spacer()
+            VStack(spacing: 4) {
+                RateLimiterStatusView()
+                Button {
+                    selection = .profile
+                } label: {
+                    HStack(spacing: 8) {
+                        ProfileAvatarView(userProfile: userProfile, size: 28)
+                        Text(userProfile?.displayName ?? String(localized: "nav.profile"))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(selection == .profile ? AnyShapeStyle(.selection.opacity(0.8)) : AnyShapeStyle(.clear)),
+                    )
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(selection == .profile ? AnyShapeStyle(.selection.opacity(0.8)) : AnyShapeStyle(.clear)),
-                )
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
         }
         .navigationTitle("app.name")
+    }
+}
+
+// MARK: - Rate Limiter Status
+
+struct RateLimiterStatusView: View {
+    @State private var snap = RateLimiterSnapshot(requestsInWindow: 0, maxRequests: 27, windowSeconds: 30, oldestRequestAge: nil, newestRequestAge: nil, waitingCount: 0)
+
+    /// Seconds until the window fully resets (newest request exits)
+    private var resetIn: Double? {
+        guard let age = snap.newestRequestAge else { return nil }
+        let remaining = snap.windowSeconds - age
+        return remaining > 0 ? remaining : nil
+    }
+
+    private var usageColor: Color {
+        let ratio = Double(snap.requestsInWindow) / Double(snap.maxRequests)
+        if ratio >= 0.8 { return .red }
+        if ratio >= 0.5 { return .yellow }
+        return .green
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            // Usage bar
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.gray.opacity(0.15))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(usageColor.opacity(0.6))
+                        .frame(width: geo.size.width * min(Double(snap.requestsInWindow) / Double(snap.maxRequests), 1.0))
+                }
+            }
+            .frame(height: 4)
+
+            HStack(spacing: 0) {
+                // Stacked fraction: numerator over denominator
+                VStack(spacing: 0) {
+                    Text("\(snap.requestsInWindow)")
+                        .foregroundStyle(usageColor)
+                    Rectangle()
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(width: 20, height: 1)
+                    Text("\(snap.maxRequests)")
+                        .foregroundStyle(.tertiary)
+                }
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+
+                Text(" reqs")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
+
+                if snap.waitingCount > 0 {
+                    Text("\(snap.waitingCount) queued")
+                        .foregroundStyle(.orange)
+                } else if let secs = resetIn, snap.requestsInWindow > 0 {
+                    Text("reset \(Int(secs))s")
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .font(.system(size: 10, design: .monospaced))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(NSColor.controlBackgroundColor).opacity(0.5))
+        )
+        .task {
+            while !Task.isCancelled {
+                snap = await spotifyRateLimiter.snapshot()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
     }
 }
 

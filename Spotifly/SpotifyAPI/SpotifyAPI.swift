@@ -23,34 +23,70 @@ func spotifyExternalUrl(type: SpotifyItemType, id: String) -> String {
 
 // MARK: - Rate Limiter
 
-/// Token bucket rate limiter — caps outgoing Spotify API requests to avoid 429s.
-/// Max 5 requests/second with a burst capacity of 5.
-private actor RateLimiter {
-    private let maxTokens: Double = 5
-    private let refillRate: Double = 5 // tokens per second
-    private var tokens: Double = 5
-    private var lastRefill: Date = Date()
+/// Snapshot of a rate limiter's current state
+struct RateLimiterSnapshot: Sendable {
+    let requestsInWindow: Int
+    let maxRequests: Int
+    let windowSeconds: Double
+    let oldestRequestAge: Double? // seconds since oldest request in window
+    let newestRequestAge: Double? // seconds since newest request in window
+    let waitingCount: Int
+}
+
+/// Rolling-window rate limiter — caps outgoing Spotify requests to avoid 429s.
+/// Tracks timestamps of recent requests and delays when the limit is reached.
+actor SpotifyRateLimiter {
+    let maxRequests: Int
+    let windowSeconds: Double
+    private var timestamps: [Date] = []
+    private var _waitingCount: Int = 0
+
+    init(maxRequests: Int, windowSeconds: Double) {
+        self.maxRequests = maxRequests
+        self.windowSeconds = windowSeconds
+    }
 
     func wait() async throws {
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastRefill)
-        tokens = min(maxTokens, tokens + elapsed * refillRate)
-        lastRefill = now
+        _waitingCount += 1
+        defer { _waitingCount -= 1 }
 
-        if tokens >= 1 {
-            tokens -= 1
-            return
+        while true {
+            let now = Date()
+            let windowStart = now.addingTimeInterval(-windowSeconds)
+            timestamps.removeAll { $0 < windowStart }
+
+            if timestamps.count < maxRequests {
+                timestamps.append(now)
+                return
+            }
+
+            // Wait until the oldest request exits the window
+            let oldest = timestamps.first!
+            let delay = oldest.timeIntervalSince(windowStart)
+            try await Task.sleep(for: .seconds(max(delay, 0.1)))
         }
+    }
 
-        // Sleep until we have a token
-        let delay = (1.0 - tokens) / refillRate
-        tokens = 0
-        lastRefill = Date()
-        try await Task.sleep(for: .seconds(delay))
+    func snapshot() -> RateLimiterSnapshot {
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-windowSeconds)
+        let active = timestamps.filter { $0 >= windowStart }
+        let oldestAge = active.first.map { now.timeIntervalSince($0) }
+        let newestAge = active.last.map { now.timeIntervalSince($0) }
+        return RateLimiterSnapshot(
+            requestsInWindow: active.count,
+            maxRequests: maxRequests,
+            windowSeconds: windowSeconds,
+            oldestRequestAge: oldestAge,
+            newestRequestAge: newestAge,
+            waitingCount: _waitingCount,
+        )
     }
 }
 
-private let rateLimiter = RateLimiter()
+/// Single shared rate limiter for ALL Spotify requests (Web API + spclient).
+/// Spotify enforces 30 req / 30s in dev mode across the entire app — we use 27 for headroom.
+let spotifyRateLimiter = SpotifyRateLimiter(maxRequests: 27, windowSeconds: 30)
 
 // MARK: - Spotify API
 
@@ -66,7 +102,7 @@ enum SpotifyAPI {
     static func data(for request: URLRequest, maxRetries: Int = 3) async throws -> (Data, HTTPURLResponse) {
         var attempt = 0
         while true {
-            try await rateLimiter.wait()
+            try await spotifyRateLimiter.wait()
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw SpotifyAPIError.invalidResponse
