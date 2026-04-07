@@ -30,11 +30,8 @@ final class SpotifySession {
     /// When the current token was obtained
     private var tokenObtainedAt: Date
 
-    /// Whether a token refresh is currently in progress
-    private var isRefreshing = false
-
-    /// Continuation for callers waiting on a refresh in progress
-    private var refreshWaiters: [CheckedContinuation<String, Never>] = []
+    /// In-flight refresh task — subsequent callers await this instead of starting a new refresh
+    private var refreshTask: Task<String, Never>?
 
     /// Timestamp of last refresh failure (to prevent rapid retry loops)
     private var lastRefreshFailure: Date?
@@ -83,22 +80,26 @@ final class SpotifySession {
             return accessToken
         }
 
-        // If already refreshing, wait for that to complete
-        if isRefreshing {
-            return await withCheckedContinuation { continuation in
-                refreshWaiters.append(continuation)
-            }
+        // If already refreshing, await the in-flight task (safe: no continuation bookkeeping)
+        if let task = refreshTask {
+            return await task.value
         }
 
-        // Perform the refresh
-        return await performRefreshAndReturn(refreshToken: refreshToken)
+        // Start a new refresh and store it so concurrent callers can join it
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return "" }
+            return await self.performRefreshAndReturn(refreshToken: refreshToken)
+        }
+        refreshTask = task
+        let token = await task.value
+        // Clear only if it's still *our* task (a rapid double-expiry could replace it)
+        if refreshTask == task { refreshTask = nil }
+        return token
     }
 
     /// Performs the token refresh and returns the new token.
     /// Uses a detached task to prevent cancellation from caller's context.
     private func performRefreshAndReturn(refreshToken: String) async -> String {
-        isRefreshing = true
-
         // Use a detached task to prevent the refresh from being cancelled
         // when the calling view/task is cancelled (e.g., user navigates away)
         let result: Result<SpotifyAuthResult, Error> = await Task.detached(priority: .userInitiated) {
@@ -116,34 +117,14 @@ final class SpotifySession {
             try? KeychainManager.saveAuthResult(newResult)
             lastRefreshFailure = nil
             debugLog("SpotifySession", "Token refreshed successfully: \(String(accessToken.prefix(20)))...")
-
-            // Resume all waiters with new token
-            let token = accessToken
-            for waiter in refreshWaiters {
-                waiter.resume(returning: token)
-            }
-            refreshWaiters.removeAll()
-            isRefreshing = false
-
-            return token
+            return accessToken
 
         case let .failure(error):
             debugLog("SpotifySession", "Token refresh failed: \(error)")
-
-            // Record failure to prevent rapid retry loop
             lastRefreshFailure = Date()
-
-            // Resume waiters with current token (may be expired)
-            let token = accessToken
             let expiry = tokenObtainedAt.addingTimeInterval(TimeInterval(expiresIn))
-            debugLog("SpotifySession", "Returning old token: \(String(token.prefix(20)))... (expires in \(Int(expiry.timeIntervalSinceNow))s)")
-            for waiter in refreshWaiters {
-                waiter.resume(returning: token)
-            }
-            refreshWaiters.removeAll()
-            isRefreshing = false
-
-            return token
+            debugLog("SpotifySession", "Returning old token: \(String(accessToken.prefix(20)))... (expires in \(Int(expiry.timeIntervalSinceNow))s)")
+            return accessToken
         }
     }
 }

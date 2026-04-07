@@ -19,10 +19,17 @@ enum KeychainManager {
     /// Format: TeamID.groupName (must match keychain-access-groups in entitlements)
     nonisolated private static let accessGroup = "89S4HZY343.com.spotifly.keychain"
 
+    /// Serializes saveAuthResult / loadAuthResult so concurrent token refreshes
+    /// can never interleave and write a mismatched (access, refresh, expiry) triple.
+    nonisolated(unsafe) private static let authLock = NSLock()
+
     // MARK: - Public API
 
-    /// Saves the OAuth result to the keychain
+    /// Saves the OAuth result to the keychain (atomic w.r.t. loadAuthResult)
     static func saveAuthResult(_ result: SpotifyAuthResult) throws {
+        authLock.lock()
+        defer { authLock.unlock() }
+
         // Calculate absolute expiration time
         let expiresAt = Date().addingTimeInterval(TimeInterval(result.expiresIn))
 
@@ -41,6 +48,9 @@ enum KeychainManager {
     /// Loads the OAuth result from the keychain, returns nil if not found or expired
     /// Note: This method does NOT attempt to refresh expired tokens. Use loadAuthResultWithRefresh() for that.
     static func loadAuthResult() -> SpotifyAuthResult? {
+        authLock.lock()
+        defer { authLock.unlock() }
+
         guard let accessTokenData = load(key: accessTokenKey),
               let accessToken = String(data: accessTokenData, encoding: .utf8),
               let expiresAtData = load(key: expiresAtKey),
