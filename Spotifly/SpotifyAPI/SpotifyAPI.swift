@@ -31,6 +31,11 @@ struct RateLimiterSnapshot: Sendable {
     let oldestRequestAge: Double? // seconds since oldest request in window
     let newestRequestAge: Double? // seconds since newest request in window
     let waitingCount: Int
+    /// Ages (in seconds) of all requests in the rolling telemetry window (60s).
+    /// 0 = now, larger = older. Used by the rate limiter chip's bar graph.
+    let historyAges: [Double]
+    /// Length of the telemetry window in seconds (always >= windowSeconds).
+    let historyWindowSeconds: Double
 }
 
 /// Rolling-window rate limiter — caps outgoing Spotify requests to avoid 429s.
@@ -38,6 +43,9 @@ struct RateLimiterSnapshot: Sendable {
 actor SpotifyRateLimiter {
     let maxRequests: Int
     let windowSeconds: Double
+    /// Window kept for the bar-graph telemetry. Larger than windowSeconds so the
+    /// chip can show what was happening before the active limiter window started.
+    let historyWindowSeconds: Double = 60
     private var timestamps: [Date] = []
     private var _waitingCount: Int = 0
 
@@ -52,17 +60,22 @@ actor SpotifyRateLimiter {
 
         for _ in 0 ..< 300 { // safety: max 300 iterations (~30s at 0.1s each)
             let now = Date()
-            let windowStart = now.addingTimeInterval(-windowSeconds)
-            timestamps.removeAll { $0 < windowStart }
+            // Drop entries outside the telemetry window — limiter logic filters
+            // its own (shorter) window below.
+            let historyStart = now.addingTimeInterval(-historyWindowSeconds)
+            timestamps.removeAll { $0 < historyStart }
 
-            if timestamps.count < maxRequests {
+            let limiterStart = now.addingTimeInterval(-windowSeconds)
+            let activeCount = timestamps.reduce(0) { $1 >= limiterStart ? $0 + 1 : $0 }
+
+            if activeCount < maxRequests {
                 timestamps.append(now)
                 return
             }
 
-            // Wait until the oldest request exits the window
-            let oldest = timestamps.first!
-            let timeUntilExpiry = windowSeconds - now.timeIntervalSince(oldest)
+            // Wait until the oldest request inside the limiter window exits
+            let oldestActive = timestamps.first { $0 >= limiterStart }!
+            let timeUntilExpiry = windowSeconds - now.timeIntervalSince(oldestActive)
             let delay = max(min(timeUntilExpiry, 2.0), 0.1) // clamp between 0.1s and 2s
             try await Task.sleep(for: .seconds(delay))
         }
@@ -70,10 +83,17 @@ actor SpotifyRateLimiter {
 
     func snapshot() -> RateLimiterSnapshot {
         let now = Date()
-        let windowStart = now.addingTimeInterval(-windowSeconds)
-        let active = timestamps.filter { $0 >= windowStart }
+        let historyStart = now.addingTimeInterval(-historyWindowSeconds)
+        // Drop stale telemetry entries on every snapshot so the chip stays accurate
+        // even when no new requests are firing.
+        timestamps.removeAll { $0 < historyStart }
+
+        let limiterStart = now.addingTimeInterval(-windowSeconds)
+        let active = timestamps.filter { $0 >= limiterStart }
         let oldestAge = active.first.map { now.timeIntervalSince($0) }
         let newestAge = active.last.map { now.timeIntervalSince($0) }
+        let historyAges = timestamps.map { now.timeIntervalSince($0) }
+
         return RateLimiterSnapshot(
             requestsInWindow: active.count,
             maxRequests: maxRequests,
@@ -81,6 +101,8 @@ actor SpotifyRateLimiter {
             oldestRequestAge: oldestAge,
             newestRequestAge: newestAge,
             waitingCount: _waitingCount,
+            historyAges: historyAges,
+            historyWindowSeconds: historyWindowSeconds,
         )
     }
 }
