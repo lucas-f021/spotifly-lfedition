@@ -1,3 +1,18 @@
+adding ontop of an already great project. i tweaked it to my usecase:
+
+local cacheing up to 10mbs- spotify api sux. 429'ed almost instantly. this helps you not get banned for hours from the api
+on the topic of 429s, i limited api reqs to 20 in a 30 sec rolling window. 
+
+with these changes, i've had 0 issues with 429s.
+
+added:
+eq band
+local file support
+fixed playback when trying to control songs from another device
+alot more changes to make it more similar to official spotify client
+s
+---
+
 # Spotifly
 
 A lightweight Spotify player for macOS.
