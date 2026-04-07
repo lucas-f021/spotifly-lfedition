@@ -20,6 +20,8 @@ struct NowPlayingBarView: View {
 
     @State private var cachedAlbumArtImage: Image?
     @State private var cachedAlbumArtURL: String?
+    /// Dominant color extracted from current album art, used to tint the bar background.
+    @State private var dominantColor: Color?
     @State private var showVolumePopover = false
     @State private var showAlbumArtMenu = false
     @State private var isHoveringSeekBar = false
@@ -48,11 +50,34 @@ struct NowPlayingBarView: View {
     private let barWidth: CGFloat = 700
     private let barHeight: CGFloat = 60
 
+    /// URL of the currently displayed album art (used to trigger color extraction)
+    private var currentAlbumArtURL: URL? {
+        currentTrack?.images.url(for: 300, scale: displayScale)
+    }
+
     var body: some View {
         playerLayout
             .frame(width: windowState.isMiniPlayerMode ? nil : barWidth, height: windowState.isMiniPlayerMode ? nil : barHeight)
             .frame(maxWidth: windowState.isMiniPlayerMode ? .infinity : nil, maxHeight: windowState.isMiniPlayerMode ? .infinity : nil)
-            .modifier(NowPlayingBarBackground(isMiniPlayerMode: windowState.isMiniPlayerMode))
+            .modifier(NowPlayingBarBackground(isMiniPlayerMode: windowState.isMiniPlayerMode, tint: dominantColor))
+            .onChange(of: currentAlbumArtURL) { _, newURL in
+                guard let newURL else { dominantColor = nil; return }
+                DominantColorCache.shared.color(for: newURL) { color in
+                    withAnimation(.easeInOut(duration: 0.4)) {
+                        dominantColor = color
+                    }
+                }
+            }
+            .task {
+                // Initial extraction on first appearance
+                if let url = currentAlbumArtURL {
+                    DominantColorCache.shared.color(for: url) { color in
+                        withAnimation(.easeInOut(duration: 0.4)) {
+                            dominantColor = color
+                        }
+                    }
+                }
+            }
             .padding([.leading, .trailing], windowState.isMiniPlayerMode ? 0 : 40)
             .padding([.bottom], windowState.isMiniPlayerMode ? 0 : 20)
             .alert("playlist.new.title", isPresented: $showNewPlaylistDialog) {
@@ -509,17 +534,31 @@ struct NowPlayingBarView: View {
 
 // MARK: - Glass Effect Background
 
-/// Applies either a solid background (mini player) or liquid glass effect (expanded mode)
+/// Applies either a solid background (mini player) or liquid glass effect (expanded mode).
+/// When `tint` is non-nil, blends it on top so the bar takes on the album-art's dominant color.
 private struct NowPlayingBarBackground: ViewModifier {
     let isMiniPlayerMode: Bool
+    let tint: Color?
 
     func body(content: Content) -> some View {
         if isMiniPlayerMode {
             content
-                .background(Color(NSColor.windowBackgroundColor))
+                .background(
+                    ZStack {
+                        Color(NSColor.windowBackgroundColor)
+                        if let tint { tint.opacity(0.35) }
+                    }
+                )
         } else {
             content
                 .glassEffect(.regular, in: .capsule)
+                .background(
+                    Group {
+                        if let tint {
+                            Capsule().fill(tint.opacity(0.4))
+                        }
+                    }
+                )
                 .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
         }
     }
