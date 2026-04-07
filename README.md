@@ -6,11 +6,12 @@ on the topic of 429s, i limited api reqs to 20 in a 30 sec rolling window.
 with these changes, i've had 0 issues with 429s.
 
 added:
-eq band
-local file support
-fixed playback when trying to control songs from another device
-alot more changes to make it more similar to official spotify client
-s
+
+- eq band
+- local file support
+- fixed playback when trying to control songs from another device
+- alot more changes to make it more similar to official spotify clients
+
 ---
 
 # Spotifly
