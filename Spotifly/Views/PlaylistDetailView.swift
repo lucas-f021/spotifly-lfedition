@@ -43,6 +43,7 @@ struct PlaylistDetailView: View {
         self.playlistId = playlistId
         initialPlaylist = nil
         self.playbackViewModel = playbackViewModel
+        _isCached = State(initialValue: Self.cachedPlaylistIds.contains(playlistId))
     }
 
     /// Initialize with a pre-loaded playlist (avoids network request)
@@ -50,12 +51,29 @@ struct PlaylistDetailView: View {
         playlistId = playlist.id
         initialPlaylist = playlist
         self.playbackViewModel = playbackViewModel
+        _isCached = State(initialValue: Self.cachedPlaylistIds.contains(playlist.id))
     }
 
     /// Tracks from the store for this playlist
+    /// Returns all tracks for this playlist. Tracks not yet in the store
+    /// (evicted by LRU or not yet fetched) are represented as stubs.
     private var tracks: [Track] {
         guard let storedPlaylist = store.playlists[playlistId] else { return [] }
-        return storedPlaylist.trackIds.compactMap { store.tracks[$0] }
+        return storedPlaylist.trackIds.map { id in
+            store.tracks[id] ?? Track(
+                id: id,
+                name: "",
+                uri: "spotify:track:\(id)",
+                durationMs: 0,
+                trackNumber: nil,
+                externalUrl: nil,
+                albumId: nil,
+                artistId: nil,
+                artistName: "",
+                albumName: nil,
+                images: .empty,
+            )
+        }
     }
 
     /// Whether the current user owns this playlist
@@ -93,6 +111,10 @@ struct PlaylistDetailView: View {
             // Debounce: if user clicks through playlists quickly, cancel before firing requests
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
+
+            // Sync cached state (State doesn't reinit when playlistId changes)
+            isCached = Self.cachedPlaylistIds.contains(playlistId)
+
             // Use initial playlist if provided, otherwise fetch
             if let initialPlaylist {
                 playlist = initialPlaylist
@@ -102,6 +124,9 @@ struct PlaylistDetailView: View {
                 await loadPlaylist()
             }
             await loadTracks()
+
+            // Pre-fetch all stubs in background (auto-caches to disk)
+            await prefetchAllMetadata()
         }
         .onChange(of: playlistId) {
             if let playlist {
@@ -250,18 +275,71 @@ struct PlaylistDetailView: View {
         }
     }
 
+    /// True when this playlist is pinned AND all its tracks are actually loaded.
+    private var isFullyCached: Bool {
+        guard isCached else { return false }
+        let stubCount = tracks.filter { $0.isStub }.count
+        return stubCount == 0
+    }
+
+    private var cacheButtonLabel: String {
+        if !isCached { return "Cache Playlist" }
+        if cacheProgress != nil { return "Caching..." }
+        if isFullyCached { return "Cached" }
+        return "Re-cache"
+    }
+
+    private var cacheButtonIcon: String {
+        if !isCached { return "arrow.down.circle" }
+        if isFullyCached { return "arrow.down.circle.fill" }
+        return "arrow.clockwise.circle"
+    }
+
+    private var cacheButtonTint: Color {
+        if !isCached { return .secondary }
+        if isFullyCached { return .green }
+        return .orange
+    }
+
     private func playlistActions() -> some View {
-        Button {
-            playAllTracks()
-        } label: {
-            Label("playback.play_playlist", systemImage: "play.fill")
-                .font(.headline)
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
+        VStack(spacing: 12) {
+            Button {
+                playAllTracks()
+            } label: {
+                Label("playback.play_playlist", systemImage: "play.fill")
+                    .font(.headline)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .disabled(tracks.isEmpty)
+
+            HStack(spacing: 8) {
+                Button {
+                    toggleCached()
+                } label: {
+                    Label(
+                        cacheButtonLabel,
+                        systemImage: cacheButtonIcon
+                    )
+                    .font(.subheadline)
+                }
+                .buttonStyle(.bordered)
+                .tint(cacheButtonTint)
+            }
+
+            if let progress = cacheProgress {
+                VStack(spacing: 4) {
+                    ProgressView(value: progress)
+                        .tint(.green)
+                    Text("Caching \(Int(progress * 100))%")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 160)
+            }
         }
-        .buttonStyle(.borderedProminent)
-        .tint(.green)
-        .disabled(tracks.isEmpty)
     }
 
     @ViewBuilder
@@ -278,10 +356,26 @@ struct PlaylistDetailView: View {
         }
     }
 
+    /// Set of track IDs currently being fetched (prevents duplicate requests)
+    @State private var fetchingTrackIds: Set<String> = []
+    /// LRU order of track IDs with loaded metadata (most recent at end)
+    @State private var metadataLRU: [String] = []
+    /// Max number of tracks to keep full metadata for — evict beyond this
+    private let metadataCacheLimit = 50
+    /// Whether this playlist is pinned (all metadata pre-cached, no eviction).
+    /// Initialized from UserDefaults so it's correct before any .task fires.
+    @State private var isCached: Bool
+    /// Progress of background cache operation (0.0–1.0)
+    @State private var cacheProgress: Double?
+
     private var normalTrackList: some View {
         LazyVStack(alignment: .leading, spacing: 0) {
             ForEach(Array(tracks.enumerated()), id: \.offset) { index, track in
                 trackRowView(track: track, index: index)
+                    .task(id: track.id) {
+                        // Fetch metadata for visible stubs (prefetch handles the rest in background)
+                        await fetchMetadataIfNeeded(for: track)
+                    }
 
                 if index < tracks.count - 1 {
                     Divider()
@@ -295,52 +389,205 @@ struct PlaylistDetailView: View {
         .padding(.bottom, 100)
     }
 
+    /// Fetches full metadata for a stub track on demand, evicting old entries if over the limit.
+    private func fetchMetadataIfNeeded(for track: Track) async {
+        // Touch LRU even for non-stubs (already loaded) to keep them fresh
+        if !track.isStub {
+            touchLRU(track.id)
+            return
+        }
+        guard !fetchingTrackIds.contains(track.id) else { return }
+
+        fetchingTrackIds.insert(track.id)
+        defer { fetchingTrackIds.remove(track.id) }
+
+        do {
+            let apiTrack = try await SpotifyAPI.fetchTrackMetadataSpclient(trackId: track.id)
+            let fullTrack = Track(from: apiTrack)
+            store.upsertTrack(fullTrack)
+            touchLRU(track.id)
+            evictIfNeeded()
+        } catch {
+            debugLog("PlaylistDetailView", "Failed to fetch metadata for \(track.id): \(error)")
+        }
+    }
+
+    /// Moves a track ID to the end of the LRU list (most recently used).
+    private func touchLRU(_ trackId: String) {
+        metadataLRU.removeAll { $0 == trackId }
+        metadataLRU.append(trackId)
+    }
+
+    // MARK: - Playlist Caching
+
+    /// Persisted set of playlist IDs whose metadata is fully cached.
+    static var cachedPlaylistIds: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "cachedPlaylistIds") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: "cachedPlaylistIds") }
+    }
+
+    /// Toggles the cached state for this playlist.
+    private func toggleCached() {
+        if isCached {
+            // Unpin
+            isCached = false
+            Self.cachedPlaylistIds.remove(playlistId)
+        } else {
+            // Pin — start pre-fetching
+            isCached = true
+            Self.cachedPlaylistIds.insert(playlistId)
+            Task { await prefetchAllMetadata() }
+        }
+    }
+
+    /// Pre-fetches metadata for all stub tracks in this playlist (rate-limited).
+    private func prefetchAllMetadata() async {
+        let stubs = tracks.filter { $0.isStub }
+        guard !stubs.isEmpty else {
+            cacheProgress = nil
+            return
+        }
+
+        let total = stubs.count
+        cacheProgress = 0
+        var fetchedSinceLastSave = 0
+
+        for (i, stub) in stubs.enumerated() {
+            guard !Task.isCancelled else { break }
+            guard fetchingTrackIds.insert(stub.id).inserted else { continue }
+            defer { fetchingTrackIds.remove(stub.id) }
+
+            do {
+                let apiTrack = try await SpotifyAPI.fetchTrackMetadataSpclient(trackId: stub.id)
+                let fullTrack = Track(from: apiTrack)
+                store.upsertTrack(fullTrack)
+                fetchedSinceLastSave += 1
+            } catch {
+                debugLog("PlaylistDetailView", "Cache prefetch failed for \(stub.id): \(error)")
+            }
+
+            cacheProgress = Double(i + 1) / Double(total)
+
+            // Save to disk every 25 tracks so progress survives interruption
+            if fetchedSinceLastSave >= 25 {
+                StoreCache.save(from: store)
+                fetchedSinceLastSave = 0
+            }
+        }
+
+        cacheProgress = nil
+        StoreCache.save(from: store)
+    }
+
+    /// Evicts the oldest metadata entries when over the cache limit.
+    /// Skips tracks referenced by albums, other playlists, favorites, or cached playlists.
+    private func evictIfNeeded() {
+        // Cached playlists never evict
+        guard !isCached else { return }
+        // Build set of track IDs that are protected (used outside this playlist)
+        let cachedIds = Self.cachedPlaylistIds
+        var protectedIds = Set<String>()
+        for (id, album) in store.albums where album.tracksLoaded {
+            protectedIds.formUnion(album.trackIds)
+        }
+        for (id, playlist) in store.playlists where id != playlistId {
+            // Always protect cached playlists' tracks
+            if cachedIds.contains(id) {
+                protectedIds.formUnion(playlist.trackIds)
+            }
+        }
+        protectedIds.formUnion(store.favoriteTrackIds)
+        protectedIds.formUnion(store.savedTrackIds)
+
+        while metadataLRU.count > metadataCacheLimit {
+            let evictId = metadataLRU.removeFirst()
+            // Never evict tracks used by other views
+            guard !protectedIds.contains(evictId) else { continue }
+            store.removeTrack(evictId)
+        }
+    }
+
     @ViewBuilder
     private func trackRowView(track: Track, index: Int) -> some View {
-        let row = TrackRow(
-            track: track,
-            index: index,
-            currentlyPlayingURI: playbackViewModel.currentlyPlayingURI,
-            playbackViewModel: playbackViewModel,
-            currentSection: .playlists,
-            selectionId: playlistId,
-            onDoubleTap: {
-                guard let uri = playlist?.uri else { return }
-                let token = await session.validAccessToken()
-                await playbackViewModel.play(
-                    uriOrUrl: uri,
-                    trackIndex: index,
-                    accessToken: token,
-                )
-            },
-        )
-
-        if isOwner {
-            row
-                .opacity(draggedTrackId == track.id ? 0.5 : 1.0)
-                .onDrag {
-                    draggedTrackId = track.id
-                    // Capture original index BEFORE any optimistic updates
-                    if let playlist = store.playlists[playlistId] {
-                        draggedFromIndex = playlist.trackIds.firstIndex(of: track.id)
-                    }
-                    return NSItemProvider(object: track.id as NSString)
-                }
-                .onDrop(
-                    of: [.text],
-                    delegate: PlaylistReorderDropDelegate(
-                        targetTrackId: track.id,
-                        playlistId: playlistId,
-                        draggedTrackId: $draggedTrackId,
-                        draggedFromIndex: $draggedFromIndex,
-                        store: store,
-                        playlistService: playlistService,
-                        session: session,
-                    ),
-                )
+        if track.isStub {
+            stubTrackRow(index: index)
         } else {
-            row
+            let row = TrackRow(
+                track: track,
+                index: index,
+                currentlyPlayingURI: playbackViewModel.currentlyPlayingURI,
+                playbackViewModel: playbackViewModel,
+                currentSection: .playlists,
+                selectionId: playlistId,
+                onDoubleTap: {
+                    if track.isLocalFile {
+                        playbackViewModel.playLocalFile(track)
+                    } else {
+                        guard let playlistUri = playlist?.uri else { return }
+                        let token = await session.validAccessToken()
+                        await playbackViewModel.playContext(
+                            playlistUri,
+                            trackUri: track.uri,
+                            accessToken: token,
+                        )
+                    }
+                },
+            )
+
+            if isOwner {
+                row
+                    .opacity(draggedTrackId == track.id ? 0.5 : 1.0)
+                    .onDrag {
+                        draggedTrackId = track.id
+                        // Capture original index BEFORE any optimistic updates
+                        if let playlist = store.playlists[playlistId] {
+                            draggedFromIndex = playlist.trackIds.firstIndex(of: track.id)
+                        }
+                        return NSItemProvider(object: track.id as NSString)
+                    }
+                    .onDrop(
+                        of: [.text],
+                        delegate: PlaylistReorderDropDelegate(
+                            targetTrackId: track.id,
+                            playlistId: playlistId,
+                            draggedTrackId: $draggedTrackId,
+                            draggedFromIndex: $draggedFromIndex,
+                            store: store,
+                            playlistService: playlistService,
+                            session: session,
+                        ),
+                    )
+            } else {
+                row
+            }
         }
+    }
+
+    /// Placeholder row shown while track metadata is loading
+    private func stubTrackRow(index: Int) -> some View {
+        HStack(spacing: 12) {
+            Text("\(index + 1)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 30, alignment: .center)
+
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.gray.opacity(0.15))
+                .frame(width: 40, height: 40)
+
+            VStack(alignment: .leading, spacing: 4) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.gray.opacity(0.15))
+                    .frame(width: 140, height: 12)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.gray.opacity(0.1))
+                    .frame(width: 90, height: 10)
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
     }
 
     private func deletePlaylist() {
@@ -435,6 +682,7 @@ struct PlaylistDetailView: View {
                 playlistId: playlistId,
                 accessToken: token,
             )
+            StoreCache.save(from: store)
         } catch {
             errorMessage = error.localizedDescription
         }

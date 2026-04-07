@@ -51,6 +51,13 @@ int32_t spotifly_play_tracks(const char* track_uris_json);
 /// Returns 0 on success, -1 on error.
 int32_t spotifly_play_uri(const char* uri_or_url, int32_t track_index);
 
+/// Plays a context URI starting at a specific track identified by track URI.
+/// Avoids index drift when local files are interspersed in the context.
+/// @param context_uri Spotify URI of the context (e.g., "spotify:playlist:xxx")
+/// @param track_uri Spotify URI of the track to start at (e.g., "spotify:track:xxx")
+/// Returns 0 on success, -1 on error.
+int32_t spotifly_play_context_with_track(const char* context_uri, const char* track_uri);
+
 /// Pauses playback.
 /// Returns 0 on success, -1 on error, -2 if session disconnected.
 int32_t spotifly_pause(void);
@@ -361,6 +368,14 @@ void spotifly_set_initial_volume(uint16_t volume);
 ///
 /// @param playlist_id Spotify playlist ID (22-character base62 string, NOT a full URI)
 char* spotifly_get_playlist_tracks_spclient(const char* playlist_id);
+
+/// Fetches full metadata for a single track via spclient (SpTrack::get).
+/// Returns a JSON string matching TrackCodable format, or NULL on error.
+///
+/// IMPORTANT: The caller must free the returned string with spotifly_free_string().
+///
+/// @param track_id Spotify track ID (22-character base62 string, NOT a full URI)
+char* spotifly_get_track_metadata(const char* track_id);
 
 #ifdef __cplusplus
 }

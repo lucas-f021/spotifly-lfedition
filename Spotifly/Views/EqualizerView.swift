@@ -38,6 +38,7 @@ struct EqualizerView: View {
                     .toggleStyle(.switch)
                     .onChange(of: isEnabled) { _, val in
                         sharedEqualizer.setEnabled(val)
+                        LocalAudioPlayer.shared.syncEQFromEqualizer()
                     }
             }
             .padding()
@@ -116,6 +117,7 @@ struct EqualizerView: View {
                 default: break
                 }
                 sharedEqualizer.setGain(Float(newValue), forBand: index)
+                LocalAudioPlayer.shared.syncEQFromEqualizer()
             }
         )
     }
@@ -124,6 +126,7 @@ struct EqualizerView: View {
         band0 = 0; band1 = 0; band2 = 0
         band3 = 0; band4 = 0; band5 = 0
         sharedEqualizer.reset()
+        LocalAudioPlayer.shared.syncEQFromEqualizer()
     }
 }
 

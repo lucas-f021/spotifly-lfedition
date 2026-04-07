@@ -3,56 +3,12 @@
 //  Spotifly
 //
 //  6-band graphic EQ applied to the PCM stream in AudioRenderer.feedRenderer().
-//  DSP: Direct Form II Transposed biquad filters (RBJ Audio EQ Cookbook).
+//  DSP: vDSP_biquad (hardware-accelerated SIMD) with RBJ Audio EQ Cookbook coefficients.
 //  Thread safety: NSLock guards coefficients + state.
-//  renderQueue holds the lock for ~20µs per chunk — no audible impact.
 //
 
+import Accelerate
 import Foundation
-
-// MARK: - Biquad Filter
-
-/// Direct Form II Transposed biquad filter with per-channel state.
-/// Coefficients are normalized (divided by a0).
-private struct BiquadFilter {
-    // Normalized feed-forward coefficients
-    var b0: Float
-    var b1: Float
-    var b2: Float
-    // Normalized feed-back coefficients (negated, per DFT-II convention)
-    var a1: Float
-    var a2: Float
-
-    // Per-channel delay state
-    var w1L: Float = 0
-    var w2L: Float = 0
-    var w1R: Float = 0
-    var w2R: Float = 0
-
-    /// Identity filter (0dB passthrough)
-    static var identity: BiquadFilter {
-        BiquadFilter(b0: 1, b1: 0, b2: 0, a1: 0, a2: 0)
-    }
-
-    /// Process one stereo sample pair in-place.
-    @inline(__always)
-    nonisolated mutating func process(left: inout Float, right: inout Float) {
-        let yL = b0 * left + w1L
-        w1L = b1 * left - a1 * yL + w2L
-        w2L = b2 * left - a2 * yL
-        left = yL
-
-        let yR = b0 * right + w1R
-        w1R = b1 * right - a1 * yR + w2R
-        w2R = b2 * right - a2 * yR
-        right = yR
-    }
-
-    /// Zero delay state (call when enabling/disabling to avoid transients)
-    nonisolated mutating func resetState() {
-        w1L = 0; w2L = 0; w1R = 0; w2R = 0
-    }
-}
 
 // MARK: - Equalizer
 
@@ -67,24 +23,36 @@ final class Equalizer: @unchecked Sendable {
     }
 
     nonisolated(unsafe) static let bands: [Band] = [
-        Band(frequency:    60, type: .lowShelf),
-        Band(frequency:   150, type: .peaking),
-        Band(frequency:   400, type: .peaking),
-        Band(frequency:  1000, type: .peaking),
-        Band(frequency:  2400, type: .peaking),
+        Band(frequency: 60, type: .lowShelf),
+        Band(frequency: 150, type: .peaking),
+        Band(frequency: 400, type: .peaking),
+        Band(frequency: 1000, type: .peaking),
+        Band(frequency: 2400, type: .peaking),
         Band(frequency: 15000, type: .highShelf),
     ]
 
     nonisolated(unsafe) static let bandCount = 6
-    nonisolated(unsafe) static let gainRange: ClosedRange<Float> = -12...12
+    nonisolated(unsafe) static let gainRange: ClosedRange<Float> = -12 ... 12
 
     // MARK: - State
-    // All stored properties are nonisolated(unsafe) — the NSLock provides thread safety.
 
     nonisolated(unsafe) private let lock = NSLock()
-    nonisolated(unsafe) private var filters: [BiquadFilter]
     nonisolated(unsafe) private(set) var isEnabled: Bool
-    nonisolated(unsafe) private var gains: [Float] // dB, one per band
+    nonisolated(unsafe) private var gains: [Float]
+
+    /// vDSP biquad setups — one per band per channel (L/R)
+    nonisolated(unsafe) private var setupsL: [vDSP_biquad_Setup?]
+    nonisolated(unsafe) private var setupsR: [vDSP_biquad_Setup?]
+    /// Delay state for vDSP_biquad: 2 sections × (2+1) = array of length 6 per setup,
+    /// but we use single-section so length 2+1 = 3... actually vDSP needs 2*2+2 = 6 per section.
+    /// For 1 section: delays array must have at least 2*2+2 = 6 elements.
+    nonisolated(unsafe) private var delaysL: [[Float]]
+    nonisolated(unsafe) private var delaysR: [[Float]]
+
+    /// Scratch buffers for deinterleaving (raw pointers, reused across calls)
+    nonisolated(unsafe) private var scratchA: UnsafeMutablePointer<Float>?
+    nonisolated(unsafe) private var scratchB: UnsafeMutablePointer<Float>?
+    nonisolated(unsafe) private var scratchCapacity: Int = 0
 
     private nonisolated(unsafe) static let sampleRate: Float = 44100
     private nonisolated(unsafe) static let peakingQ: Float = 1.0
@@ -92,32 +60,24 @@ final class Equalizer: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// Initializes with flat response (all bands 0dB, disabled).
-    /// The UI layer must call setGain/setEnabled at startup to restore persisted state.
     nonisolated init() {
         gains = [Float](repeating: 0, count: Self.bandCount)
         isEnabled = false
-        filters = Self.makeFilters(gains: gains)
+        setupsL = []
+        setupsR = []
+        delaysL = []
+        delaysR = []
+        rebuildSetups()
     }
 
-    // MARK: - Public API (called from main thread)
+    // MARK: - Public API
 
-    /// Update gain for a single band. Recomputes coefficients immediately.
     nonisolated func setGain(_ gain: Float, forBand index: Int) {
         guard (0 ..< Self.bandCount).contains(index) else { return }
         let clamped = max(Self.gainRange.lowerBound, min(Self.gainRange.upperBound, gain))
         lock.lock()
         gains[index] = clamped
-        let newFilters = Self.makeFilters(gains: gains)
-        for i in 0 ..< filters.count {
-            // Preserve delay state — avoids pop when gain changes during playback
-            var f = newFilters[i]
-            f.w1L = filters[i].w1L
-            f.w2L = filters[i].w2L
-            f.w1R = filters[i].w1R
-            f.w2R = filters[i].w2R
-            filters[i] = f
-        }
+        rebuildSetups()
         lock.unlock()
     }
 
@@ -125,23 +85,21 @@ final class Equalizer: @unchecked Sendable {
         lock.lock()
         isEnabled = enabled
         if !enabled {
-            for i in 0 ..< filters.count { filters[i].resetState() }
+            resetDelays()
         }
         lock.unlock()
     }
 
-    /// Current gain for a band (for reading back into UI).
     nonisolated func gain(forBand index: Int) -> Float {
         lock.lock()
         defer { lock.unlock() }
         return gains[index]
     }
 
-    /// Reset all bands to 0dB.
     nonisolated func reset() {
         lock.lock()
         gains = [Float](repeating: 0, count: Self.bandCount)
-        filters = Self.makeFilters(gains: gains)
+        rebuildSetups()
         lock.unlock()
     }
 
@@ -149,34 +107,86 @@ final class Equalizer: @unchecked Sendable {
 
     /// Process an interleaved stereo Float32 buffer in-place.
     /// `count` is the total number of floats (frames × 2 channels).
+    @inline(__always)
     nonisolated func process(_ ptr: UnsafeMutablePointer<Float>, count: Int) {
+        guard isEnabled else { return }
+
         lock.lock()
         defer { lock.unlock() }
 
-        var i = 0
-        let limit = count - 1
-        while i < limit {
-            for j in 0 ..< filters.count {
-                filters[j].process(left: &ptr[i], right: &ptr[i + 1])
-            }
-            i += 2
+        let frameCount = count / 2
+
+        // Ensure scratch buffers are large enough
+        if scratchCapacity < frameCount {
+            scratchA?.deallocate()
+            scratchB?.deallocate()
+            // Allocate two scratch buffers: A holds channel data, B is biquad output
+            scratchA = .allocate(capacity: frameCount * 2) // L and R contiguous
+            scratchB = .allocate(capacity: frameCount)
+            scratchCapacity = frameCount
         }
+
+        guard let scratchA, let scratchB else { return }
+
+        // L channel = scratchA[0..<frameCount], R channel = scratchA[frameCount..<frameCount*2]
+        let channelL = scratchA
+        let channelR = scratchA.advanced(by: frameCount)
+
+        // Deinterleave: LRLRLR → L,L,L + R,R,R
+        var split = DSPSplitComplex(realp: channelL, imagp: channelR)
+        let complexPtr = UnsafeRawPointer(ptr).assumingMemoryBound(to: DSPComplex.self)
+        vDSP_ctoz(complexPtr, 2, &split, 1, vDSP_Length(frameCount))
+
+        // Apply each biquad band — output to scratchB, then swap pointers
+        for i in 0 ..< Self.bandCount {
+            guard let setupL = setupsL[i], let setupR = setupsR[i] else { continue }
+
+            vDSP_biquad(setupL, &delaysL[i], channelL, 1, scratchB, 1, vDSP_Length(frameCount))
+            memcpy(channelL, scratchB, frameCount * MemoryLayout<Float>.size)
+
+            vDSP_biquad(setupR, &delaysR[i], channelR, 1, scratchB, 1, vDSP_Length(frameCount))
+            memcpy(channelR, scratchB, frameCount * MemoryLayout<Float>.size)
+        }
+
+        // Interleave back: L,L,L + R,R,R → LRLRLR
+        split = DSPSplitComplex(realp: channelL, imagp: channelR)
+        let outComplex = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: DSPComplex.self)
+        vDSP_ztoc(&split, 1, outComplex, 2, vDSP_Length(frameCount))
+    }
+
+    // MARK: - Setup
+
+    /// Rebuilds vDSP_biquad setups from current gains. Must be called under lock.
+    private nonisolated func rebuildSetups() {
+        // Destroy old setups
+        for setup in setupsL { if let s = setup { vDSP_biquad_DestroySetup(s) } }
+        for setup in setupsR { if let s = setup { vDSP_biquad_DestroySetup(s) } }
+
+        setupsL = (0 ..< Self.bandCount).map { i in
+            Self.createSetup(type: Self.bands[i].type, frequency: Self.bands[i].frequency, gainDB: gains[i])
+        }
+        setupsR = (0 ..< Self.bandCount).map { i in
+            Self.createSetup(type: Self.bands[i].type, frequency: Self.bands[i].frequency, gainDB: gains[i])
+        }
+
+        // Reset delay state
+        resetDelays()
+    }
+
+    private nonisolated func resetDelays() {
+        delaysL = (0 ..< Self.bandCount).map { _ in [Float](repeating: 0, count: 2 + 2) }
+        delaysR = (0 ..< Self.bandCount).map { _ in [Float](repeating: 0, count: 2 + 2) }
     }
 
     // MARK: - Coefficient Math (RBJ Audio EQ Cookbook)
 
-    private nonisolated static func makeFilters(gains: [Float]) -> [BiquadFilter] {
-        (0 ..< bandCount).map { i in
-            makeFilter(type: bands[i].type, frequency: bands[i].frequency, gainDB: gains[i])
-        }
-    }
-
-    private nonisolated static func makeFilter(type: FilterType, frequency: Float, gainDB: Float) -> BiquadFilter {
-        // A = 10^(dBgain/40) — amplitude ratio for the given dB gain
-        let A = pow(10, gainDB / 40)
+    /// Creates a vDSP_biquad_Setup with coefficients for the given filter type.
+    /// Coefficients: [b0, b1, b2, a1, a2] (a0 normalized to 1.0)
+    private nonisolated static func createSetup(type: FilterType, frequency: Float, gainDB: Float) -> vDSP_biquad_Setup? {
         let w0 = 2 * Float.pi * frequency / sampleRate
         let cosW0 = cos(w0)
         let sinW0 = sin(w0)
+        let A = pow(10.0, gainDB / 40.0)
 
         let b0, b1, b2, a0, a1, a2: Float
 
@@ -191,33 +201,36 @@ final class Equalizer: @unchecked Sendable {
             a2 = 1 - alpha / A
 
         case .lowShelf:
-            let alpha = sinW0 / 2 * sqrt((A + 1 / A) * (1 / shelfSlope - 1) + 2)
             let sqrtA = sqrt(A)
-            b0 =      A * ((A + 1) - (A - 1) * cosW0 + 2 * sqrtA * alpha)
-            b1 =  2 * A * ((A - 1) - (A + 1) * cosW0)
-            b2 =      A * ((A + 1) - (A - 1) * cosW0 - 2 * sqrtA * alpha)
-            a0 =          (A + 1) + (A - 1) * cosW0 + 2 * sqrtA * alpha
-            a1 =     -2 * ((A - 1) + (A + 1) * cosW0)
-            a2 =          (A + 1) + (A - 1) * cosW0 - 2 * sqrtA * alpha
+            let alpha = sinW0 / 2 * sqrt((A + 1 / A) * (1 / shelfSlope - 1) + 2)
+            b0 = A * ((A + 1) - (A - 1) * cosW0 + 2 * sqrtA * alpha)
+            b1 = 2 * A * ((A - 1) - (A + 1) * cosW0)
+            b2 = A * ((A + 1) - (A - 1) * cosW0 - 2 * sqrtA * alpha)
+            a0 = (A + 1) + (A - 1) * cosW0 + 2 * sqrtA * alpha
+            a1 = -2 * ((A - 1) + (A + 1) * cosW0)
+            a2 = (A + 1) + (A - 1) * cosW0 - 2 * sqrtA * alpha
 
         case .highShelf:
-            let alpha = sinW0 / 2 * sqrt((A + 1 / A) * (1 / shelfSlope - 1) + 2)
             let sqrtA = sqrt(A)
-            b0 =      A * ((A + 1) + (A - 1) * cosW0 + 2 * sqrtA * alpha)
+            let alpha = sinW0 / 2 * sqrt((A + 1 / A) * (1 / shelfSlope - 1) + 2)
+            b0 = A * ((A + 1) + (A - 1) * cosW0 + 2 * sqrtA * alpha)
             b1 = -2 * A * ((A - 1) + (A + 1) * cosW0)
-            b2 =      A * ((A + 1) + (A - 1) * cosW0 - 2 * sqrtA * alpha)
-            a0 =          (A + 1) - (A - 1) * cosW0 + 2 * sqrtA * alpha
-            a1 =      2 * ((A - 1) - (A + 1) * cosW0)
-            a2 =          (A + 1) - (A - 1) * cosW0 - 2 * sqrtA * alpha
+            b2 = A * ((A + 1) + (A - 1) * cosW0 - 2 * sqrtA * alpha)
+            a0 = (A + 1) - (A - 1) * cosW0 + 2 * sqrtA * alpha
+            a1 = 2 * ((A - 1) - (A + 1) * cosW0)
+            a2 = (A + 1) - (A - 1) * cosW0 - 2 * sqrtA * alpha
         }
 
-        // Normalize by a0
-        return BiquadFilter(
-            b0: b0 / a0,
-            b1: b1 / a0,
-            b2: b2 / a0,
-            a1: a1 / a0,
-            a2: a2 / a0,
-        )
+        // Normalize and create coefficients array for vDSP
+        // vDSP_biquad expects: [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+        var coefficients: [Double] = [
+            Double(b0 / a0),
+            Double(b1 / a0),
+            Double(b2 / a0),
+            Double(a1 / a0),
+            Double(a2 / a0),
+        ]
+
+        return vDSP_biquad_CreateSetup(&coefficients, 1)
     }
 }

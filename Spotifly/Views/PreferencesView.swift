@@ -16,6 +16,11 @@ struct PreferencesView: View {
                     Label("preferences.playback", systemImage: "speaker.wave.3")
                 }
 
+            LocalFilesSettingsView()
+                .tabItem {
+                    Label("Local Files", systemImage: "folder.badge.plus")
+                }
+
             StartpageSettingsView()
                 .tabItem {
                     Label("nav.startpage", systemImage: "house")
@@ -146,6 +151,78 @@ struct StartpageSettingsView: View {
             $showRecentlyPlayed
         case .topAlbums:
             $showTopAlbums
+        }
+    }
+}
+
+// MARK: - Local Files Settings Tab
+
+struct LocalFilesSettingsView: View {
+    private let localFileManager = LocalFileManager.shared
+
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let path = localFileManager.folderPath {
+                            Text(path)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text("\(localFileManager.indexedFileCount) files indexed")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("No folder selected")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Spacer()
+
+                    if localFileManager.folderPath != nil {
+                        Button("Remove") {
+                            localFileManager.clearFolder()
+                        }
+                    }
+
+                    Button("Choose Folder") {
+                        chooseFolder()
+                    }
+                }
+            } header: {
+                Text("Local Files Folder")
+            } footer: {
+                Text("Select the folder containing your local audio files (MP3, FLAC, M4A, etc). Spotifly will match them to local file entries in your playlists.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if localFileManager.isScanning {
+                Section {
+                    HStack {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Scanning files...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select your local music folder"
+        panel.prompt = "Select"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            localFileManager.setFolder(url)
         }
     }
 }

@@ -57,6 +57,14 @@ final class PlaybackViewModel {
     var currentTrackUri: String?
     var errorMessage: String?
 
+    /// In-flight guard for play/pause toggle. Prevents rapid clicks from firing
+    /// duplicate Web API calls while a previous toggle hasn't yet been confirmed
+    /// by Mercury or HTTP response.
+    @ObservationIgnored private var isTogglingPlayback = false
+
+    /// Whether the currently playing track is a local file (not Spirc)
+    private(set) var isPlayingLocalFile = false
+
     /// Returns the URI of the currently playing track (alias for currentTrackUri)
     var currentlyPlayingURI: String? {
         currentTrackUri
@@ -207,6 +215,31 @@ final class PlaybackViewModel {
         isLoading = false
     }
 
+    /// Plays a context (playlist/album) starting at a specific track identified by URI.
+    /// Avoids index drift caused by local files interspersed in the context.
+    func playContext(_ contextUri: String, trackUri: String, accessToken: String) async {
+        if !isInitialized {
+            await initializeIfNeeded(accessToken: accessToken)
+        }
+
+        guard isInitialized else {
+            errorMessage = "Player not initialized"
+            return
+        }
+
+        isLoading = true
+        errorMessage = nil
+
+        do {
+            try await SpotifyPlayer.playContext(contextUri, trackUri: trackUri)
+            handlePlaybackStarted(trackId: trackUri)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isLoading = false
+    }
+
     func playTrack(trackId: String, accessToken: String) async {
         await play(uriOrUrl: "spotify:track:\(trackId)", accessToken: accessToken)
     }
@@ -258,10 +291,52 @@ final class PlaybackViewModel {
         // Queue update will come via Mercury callback
     }
 
+    // MARK: - Local File Playback
+
+    /// Plays a local audio file, pausing any active Spirc playback.
+    func playLocalFile(_ track: Track) {
+        guard track.isLocalFile else { return }
+
+        let localFileManager = LocalFileManager.shared
+        guard let fileURL = localFileManager.findFile(for: track) else {
+            errorMessage = "Local file not found. Set your music folder in Preferences."
+            return
+        }
+
+        // Stop Spirc playback if active
+        if SpotifyPlayer.isActiveDevice {
+            SpotifyPlayer.pause()
+        }
+
+        let localPlayer = LocalAudioPlayer.shared
+        do {
+            try localPlayer.play(url: fileURL)
+            isPlayingLocalFile = true
+            currentTrackUri = track.uri
+            isPlaying = true
+            trackDurationMs = UInt32(localPlayer.duration * 1000)
+            positionAnchorMs = 0
+            positionAnchorTime = CACurrentMediaTime()
+            currentPositionMs = 0
+            errorMessage = nil
+            updateNowPlayingInfo()
+        } catch {
+            errorMessage = "Failed to play local file: \(error.localizedDescription)"
+        }
+    }
+
+    /// Stops local file playback (called before switching to Spirc).
+    private func stopLocalPlayback() {
+        guard isPlayingLocalFile else { return }
+        LocalAudioPlayer.shared.stop()
+        isPlayingLocalFile = false
+    }
+
     // MARK: - Playback State Helpers
 
     /// Common setup after playback has started
     private func handlePlaybackStarted(trackId: String) {
+        stopLocalPlayback()
         currentTrackUri = trackId
         isPlaying = true
         // Apply volume after playback starts (mixer is now initialized)
@@ -286,6 +361,7 @@ final class PlaybackViewModel {
     }
 
     func stop() {
+        stopLocalPlayback()
         SpotifyPlayer.stop()
         isPlaying = false
         currentTrackUri = nil
@@ -365,50 +441,88 @@ final class PlaybackViewModel {
     }
 
     func pause() {
+        guard !isTogglingPlayback else { return }
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.pause()
+            isPlaying = false
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             // During reconnection, session may not be fully connected yet
             guard SpotifyPlayer.isSessionConnected else {
                 debugLog("PlaybackViewModel", "pause() ignored - session not connected yet")
                 return
             }
+            isPlaying = false // optimistic; Mercury will confirm
             SpotifyPlayer.pause()
         } else {
-            // Remote control via Web API
+            // Remote control via Web API. Optimistic update + in-flight guard
+            // so the button toggles immediately and rapid clicks don't spam.
+            isTogglingPlayback = true
+            isPlaying = false
             Task {
+                defer { isTogglingPlayback = false }
                 guard let token = await tokenProvider?() else { return }
                 do {
                     try await SpotifyAPI.pausePlayback(accessToken: token)
                 } catch {
+                    isPlaying = true // revert
                     errorMessage = error.localizedDescription
                 }
             }
         }
-        // State update will come from Mercury callback
     }
 
     func resume() {
+        guard !isTogglingPlayback else { return }
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.resume()
+            isPlaying = true
+            positionAnchorTime = CACurrentMediaTime()
+            positionAnchorMs = UInt32(LocalAudioPlayer.shared.position * 1000)
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             // During reconnection, session may not be fully connected yet
             guard SpotifyPlayer.isSessionConnected else {
                 debugLog("PlaybackViewModel", "resume() ignored - session not connected yet")
                 return
             }
+            isPlaying = true // optimistic
             SpotifyPlayer.resume()
-        } else {
-            // Remote control via Web API
+            // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume.
+            // Keep the current positionAnchorMs (correct from paused state), just update the time.
+            positionAnchorTime = CACurrentMediaTime()
+            updateNowPlayingPosition()
+        } else if SpotifyPlayer.isSpircReady {
+            // Spotifly is initialized but inactive (e.g. another device took over,
+            // or this is a cold start with no active device). Pull playback here
+            // via Spirc's native transfer instead of firing Web API resume into
+            // a phantom device — that path 404s when no active device exists.
+            isTogglingPlayback = true
+            isPlaying = true // optimistic
+            SpotifyPlayer.transferToLocal()
+            // Mercury will fire a TrackChanged + PlaybackState callback once
+            // the transfer completes; clear the guard then via a brief debounce.
             Task {
+                try? await Task.sleep(for: .seconds(2))
+                isTogglingPlayback = false
+            }
+        } else {
+            // True remote control fallback — Spirc isn't even initialized.
+            isTogglingPlayback = true
+            isPlaying = true
+            Task {
+                defer { isTogglingPlayback = false }
                 guard let token = await tokenProvider?() else { return }
                 do {
                     try await SpotifyAPI.resumePlayback(accessToken: token)
                 } catch {
+                    isPlaying = false // revert
                     errorMessage = error.localizedDescription
                 }
             }
         }
-        // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume
-        // Keep the current positionAnchorMs (correct from paused state), just update the time
-        positionAnchorTime = CACurrentMediaTime()
-        updateNowPlayingPosition()
     }
 
     func toggleShuffle() {
@@ -664,6 +778,10 @@ final class PlaybackViewModel {
 
     /// Perform the actual seek operation (called after debouncing)
     private func performSeek(to positionMs: UInt32) {
+        if isPlayingLocalFile {
+            LocalAudioPlayer.shared.seek(to: Double(positionMs) / 1000.0)
+            return
+        }
         if SpotifyPlayer.isActiveDevice {
             SpotifyPlayer.seek(positionMs: positionMs)
         } else {
@@ -860,6 +978,18 @@ final class PlaybackViewModel {
 
     /// Called every second to check for drift and sync state
     private func checkDriftAndSync() {
+        // Local file playback: sync position from LocalAudioPlayer
+        if isPlayingLocalFile {
+            let localPlayer = LocalAudioPlayer.shared
+            isPlaying = localPlayer.isPlaying
+            let posMs = UInt32(localPlayer.position * 1000)
+            positionAnchorMs = posMs
+            positionAnchorTime = CACurrentMediaTime()
+            currentPositionMs = posMs
+            trackDurationMs = UInt32(localPlayer.duration * 1000)
+            return
+        }
+
         var didCorrectDrift = false
 
         defer {
@@ -978,7 +1108,9 @@ final class PlaybackViewModel {
             .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] newVolume in
                 guard let self, isInitialized else { return }
-                if SpotifyPlayer.isActiveDevice {
+                if isPlayingLocalFile {
+                    LocalAudioPlayer.shared.setVolume(Float(newVolume))
+                } else if SpotifyPlayer.isActiveDevice {
                     SpotifyPlayer.setVolume(newVolume)
                 } else {
                     let percent = Int((newVolume * 100).rounded())

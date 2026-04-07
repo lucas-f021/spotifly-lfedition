@@ -574,6 +574,7 @@ struct LoggedInView: View {
             debugLog("Search", "After search - results: \(store.searchResults != nil), error: \(store.searchErrorMessage ?? "nil")")
             if store.searchResults != nil {
                 selectedNavigationItem = .searchResults
+                StoreCache.save(from: store)
             }
         }
     }

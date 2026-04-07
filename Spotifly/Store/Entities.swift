@@ -79,6 +79,16 @@ struct Track: Identifiable, Sendable, Hashable, Codable {
     let albumName: String?
     let images: ImageSet
 
+    /// Whether this track is a stub (only has id/uri, metadata not yet loaded)
+    var isStub: Bool {
+        name.isEmpty && !isLocalFile
+    }
+
+    /// Whether this track is a local file (not on Spotify's servers)
+    var isLocalFile: Bool {
+        uri.hasPrefix("spotify:local:")
+    }
+
     var durationFormatted: String {
         formatTrackTime(milliseconds: durationMs)
     }

@@ -35,8 +35,9 @@ struct Queue {
 
 // MARK: - Cache TTLs (shared with StoreCache)
 
-let libraryTTL: TimeInterval = 24 * 60 * 60
-let favoritesTTL: TimeInterval = 60 * 60
+let libraryTTL: TimeInterval = 7 * 24 * 60 * 60  // 7 days
+let favoritesTTL: TimeInterval = 24 * 60 * 60     // 24 hours
+let tracksTTL: TimeInterval = .infinity            // never expire
 
 // MARK: - App Store
 
@@ -253,16 +254,24 @@ final class AppStore {
         favoriteTrackIds.contains(trackId)
     }
 
-    /// Upsert a single track
+    /// Upsert a single track. Stubs never overwrite full tracks.
     func upsertTrack(_ track: Track) {
+        if track.isStub, let existing = tracks[track.id], !existing.isStub {
+            return // don't replace real data with a stub
+        }
         tracks[track.id] = track
     }
 
-    /// Upsert multiple tracks
+    /// Upsert multiple tracks. Stubs never overwrite full tracks.
     func upsertTracks(_ newTracks: [Track]) {
         for track in newTracks {
-            tracks[track.id] = track
+            upsertTrack(track)
         }
+    }
+
+    /// Removes a track from the store entirely (used by LRU eviction).
+    func removeTrack(_ trackId: String) {
+        tracks.removeValue(forKey: trackId)
     }
 
     /// Upsert a single album, preserving loaded tracks if present
@@ -577,7 +586,7 @@ final class AppStore {
 
     // MARK: - Cache Accessors (read-only snapshots for StoreCache)
 
-    var cachedTracks: [String: Track] { tracks }
+    var cachedTracks: [String: Track] { tracks.filter { !$0.value.isStub } }
     var cachedAlbums: [String: Album] { albums }
     var cachedArtists: [String: Artist] { artists }
     var cachedPlaylists: [String: Playlist] { playlists }
@@ -591,8 +600,9 @@ final class AppStore {
 
     /// Applies a loaded cache snapshot to the store. Only applies sections that are not expired.
     func applyCache(_ snapshot: CacheSnapshot) {
-        if let section = snapshot.tracks, !section.isExpired(ttl: libraryTTL) {
-            tracks.merge(section.data) { _, new in new }
+        if let section = snapshot.tracks, !section.isExpired(ttl: tracksTTL) {
+            let nonStubs = section.data.filter { !$0.value.isStub }
+            tracks.merge(nonStubs) { _, new in new }
         }
         if let section = snapshot.albums, !section.isExpired(ttl: libraryTTL) {
             albums.merge(section.data) { _, new in new }

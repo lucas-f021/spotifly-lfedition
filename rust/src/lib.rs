@@ -122,9 +122,10 @@ static CURRENT_TRACK_URI: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(
 // A new play command supersedes any previous one via a monotonically increasing request_id.
 #[derive(Clone)]
 enum PendingPlayRequest {
-    Uri(String, i32),  // (uri, track_index)
-    Tracks(String),    // track_uris_json
-    Radio(String),     // seed_track_uri — re-resolves playlist and seeks to seed on retry
+    Uri(String, i32),        // (uri, track_index)
+    UriWithTrack(String, String), // (context_uri, track_uri)
+    Tracks(String),          // track_uris_json
+    Radio(String),           // seed_track_uri — re-resolves playlist and seeks to seed on retry
 }
 #[derive(Clone)]
 struct PendingPlay {
@@ -711,6 +712,21 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
             match msg_result {
                 Ok(cluster_update) => {
                     if let Some(cluster) = cluster_update.cluster.into_option() {
+                        // Update IS_ACTIVE_DEVICE based on whether the cluster's
+                        // active device matches us. This is what lets remote
+                        // controllers (e.g. the phone) hand control back to us
+                        // without requiring a player event to fire first.
+                        let our_device_id = DEVICE_ID.lock().unwrap().clone();
+                        if let Some(our_id) = our_device_id {
+                            let we_are_active = cluster.active_device_id == our_id;
+                            let was_active = IS_ACTIVE_DEVICE.swap(we_are_active, Ordering::SeqCst);
+                            if was_active != we_are_active {
+                                debug!(
+                                    "Cluster update: active device {} (was_active={} → {})",
+                                    cluster.active_device_id, was_active, we_are_active
+                                );
+                            }
+                        }
                         notify_active_device_id(&cluster.active_device_id);
                         if let Some(player_state) = cluster.player_state.into_option() {
                             send_playback_state(&player_state);
@@ -864,6 +880,13 @@ fn spawn_reconnection_loop() {
                                             match std::ffi::CString::new(uri.as_str()) {
                                                 Ok(cstr) => spotifly_play_uri(cstr.as_ptr(), *track_index),
                                                 Err(_) => return,
+                                            }
+                                        }
+                                        PendingPlayRequest::UriWithTrack(context_uri, track_uri) => {
+                                            debug!("Pending play watchdog: Playing never fired for {}/{} (id={}), re-issuing play_context_with_track", context_uri, track_uri, p.request_id);
+                                            match (std::ffi::CString::new(context_uri.as_str()), std::ffi::CString::new(track_uri.as_str())) {
+                                                (Ok(ctx), Ok(trk)) => spotifly_play_context_with_track(ctx.as_ptr(), trk.as_ptr()),
+                                                _ => return,
                                             }
                                         }
                                         PendingPlayRequest::Tracks(json) => {
@@ -1498,6 +1521,32 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                                 continue;
                             }
 
+                            // Distinguish a *handoff* (another client took over via
+                            // Spotify Connect) from a real network disconnect.
+                            // Heuristic: if a recent cluster update told us the
+                            // active device is something other than us, this
+                            // SessionDisconnected is just Spotify rotating our
+                            // connection_id as part of the takeover. Stay alive
+                            // so the remote client can still see + control us.
+                            let our_device_id = DEVICE_ID.lock().unwrap().clone().unwrap_or_default();
+                            let last_active = LAST_ACTIVE_DEVICE_ID.lock().unwrap().clone();
+                            let is_handoff = !last_active.is_empty()
+                                && last_active != our_device_id;
+
+                            if is_handoff {
+                                debug!(
+                                    "[WAKE +{}ms] SessionDisconnected is a handoff to '{}' — keeping Spirc alive",
+                                    elapsed_since_wake_ms(), last_active
+                                );
+                                IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
+                                IS_PLAYING.store(false, Ordering::SeqCst);
+                                // Don't mark_disconnected — Spirc/Session are still
+                                // valid, the dealer keeps streaming cluster updates,
+                                // and we remain visible in remote device pickers.
+                                notify_connection_state_change();
+                                continue;
+                            }
+
                             mark_disconnected("Session disconnected");
 
                             // Spawn reconnection loop if not intentionally sleeping/shutting down
@@ -2101,6 +2150,89 @@ pub extern "C" fn spotifly_play_uri(uri_or_url: *const c_char, track_index: i32)
                     IS_PLAYING.store(true, Ordering::SeqCst);
                     IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
                     set_pending_play(PendingPlayRequest::Uri(uri_str.clone(), track_index));
+                    0
+                }
+                Err(_e) => {
+                    debug!("Play error: Spirc.load() failed: {:?}", _e);
+                    -1
+                }
+            }
+        }
+        None => {
+            debug!("Play error: Spirc not initialized");
+            -1
+        }
+    }
+}
+
+/// Plays a context URI (playlist/album) starting at a specific track identified by URI.
+/// Use this instead of spotifly_play_uri with an index when tracks in the context may be
+/// interspersed with local files, to avoid index drift.
+/// @param context_uri Spotify URI of the context (e.g. "spotify:playlist:xxx")
+/// @param track_uri Spotify URI of the track to start at (e.g. "spotify:track:xxx")
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn spotifly_play_context_with_track(
+    context_uri: *const c_char,
+    track_uri: *const c_char,
+) -> i32 {
+    if context_uri.is_null() || track_uri.is_null() {
+        debug!("Play error: context_uri or track_uri is null");
+        return -1;
+    }
+
+    let ctx_str = unsafe {
+        match CStr::from_ptr(context_uri).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                debug!("Play error: invalid context_uri string");
+                return -1;
+            }
+        }
+    };
+
+    let trk_str = unsafe {
+        match CStr::from_ptr(track_uri).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                debug!("Play error: invalid track_uri string");
+                return -1;
+            }
+        }
+    };
+
+    debug!(
+        "spotifly_play_context_with_track called: context={}, track={}",
+        ctx_str, trk_str
+    );
+
+    if let Err(e) = require_session_connected() {
+        return e;
+    }
+
+    let spirc_guard = SPIRC.lock().unwrap();
+    match spirc_guard.as_ref() {
+        Some(spirc) => {
+            if let Err(e) = ensure_active_for_playback(spirc) {
+                return e;
+            }
+
+            let load_request = LoadRequest::from_context_uri(
+                ctx_str.clone(),
+                LoadRequestOptions {
+                    start_playing: true,
+                    seek_to: 0,
+                    playing_track: Some(PlayingTrack::Uri(trk_str.clone())),
+                    ..Default::default()
+                },
+            );
+
+            match spirc.load(load_request) {
+                Ok(_) => {
+                    debug!("Spirc.load() succeeded");
+                    IS_PLAYING.store(true, Ordering::SeqCst);
+                    IS_ACTIVE_DEVICE.store(true, Ordering::SeqCst);
+                    set_pending_play(PendingPlayRequest::UriWithTrack(ctx_str, trk_str));
                     0
                 }
                 Err(_e) => {
@@ -3043,6 +3175,76 @@ pub extern "C" fn spotifly_get_playlist_tracks_spclient(
     }
 }
 
+/// Fetches full metadata for a single track via spclient.
+/// Returns a newly allocated JSON C string (caller must free via spotifly_free_string),
+/// or null on error. JSON matches a single TrackCodable object.
+#[no_mangle]
+pub extern "C" fn spotifly_get_track_metadata(track_id: *const c_char) -> *mut c_char {
+    if track_id.is_null() {
+        debug!("[spclient] track_id is null");
+        return std::ptr::null_mut();
+    }
+
+    let id_str = unsafe {
+        match CStr::from_ptr(track_id).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                debug!("[spclient] invalid track_id string");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    let session = {
+        let guard = SESSION.lock().unwrap();
+        match guard.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                debug!("[spclient] no active session");
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    let result = RUNTIME.block_on(async move { fetch_track_metadata(&session, &id_str).await });
+
+    match result {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(e) => {
+            debug!("[spclient] fetch_track_metadata failed: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Returns lightweight stubs (URI + ID only) for all tracks in a playlist.
+/// No SpTrack::get calls — returns instantly with ~0 extra RAM.
+/// Swift fetches full metadata on demand per-row as the user scrolls.
+/// Simple percent-decoding (%XX → char)
+fn percent_decode_simple(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                result.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
 async fn fetch_playlist_tracks_via_spclient(
     session: &Session,
     playlist_id: &str,
@@ -3055,76 +3257,171 @@ async fn fetch_playlist_tracks_via_spclient(
         .map_err(|e| format!("SpPlaylist::get failed: {e}"))?;
 
     let track_uris: Vec<SpotifyUri> = playlist.tracks().cloned().collect();
-    debug!("[spclient] playlist {} has {} tracks", playlist_id, track_uris.len());
-
-    let futures: Vec<_> = track_uris.iter()
-        .map(|uri| SpTrack::get(session, uri))
-        .collect();
-    let results = join_all(futures).await;
+    debug!(
+        "[spclient] playlist {} has {} tracks (returning stubs)",
+        playlist_id,
+        track_uris.len()
+    );
 
     let mut items: Vec<serde_json::Value> = Vec::new();
-    for r in results {
-        match r {
-            Ok(sp_track) => {
-                let track_id = sp_track.id.to_id();
-                let track_uri = sp_track.id.to_uri();
+    for uri in &track_uris {
+        let uri_str = uri.to_uri();
 
-                let cover_url = sp_track.album.covers.first()
-                    .map(|img| format!("https://i.scdn.co/image/{}", img.id.to_base16()))
-                    .unwrap_or_default();
+        if uri_str.starts_with("spotify:local:") {
+            // Local files: parse metadata from URI
+            // Format: spotify:local:Artist:Album:Track:DurationSeconds
+            // Fields are URL-encoded (+ for spaces, %XX for special chars)
+            let parts: Vec<&str> = uri_str.splitn(6, ':').collect();
+            let (artist, album, name, duration_secs) = if parts.len() == 6 {
+                let decode = |s: &str| -> String {
+                    // Decode + as space, then percent-encoded chars
+                    let plus_decoded = s.replace('+', " ");
+                    percent_decode_simple(&plus_decoded)
+                };
+                (
+                    decode(parts[2]),
+                    decode(parts[3]),
+                    decode(parts[4]),
+                    parts[5].parse::<i64>().unwrap_or(0),
+                )
+            } else {
+                ("Unknown".to_string(), "".to_string(), "Local File".to_string(), 0i64)
+            };
 
-                let album_id = sp_track.album.id.to_id();
-                let album_uri = sp_track.album.id.to_uri();
+            // Use a stable hash of the URI as the ID (local files have no Spotify ID)
+            let local_id = format!("local:{:x}", {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                uri_str.hash(&mut h);
+                h.finish()
+            });
 
-                let artists: Vec<serde_json::Value> = sp_track.artists.iter().map(|a| {
-                    serde_json::json!({
-                        "id": a.id.to_id(),
-                        "name": a.name,
-                        "uri": a.id.to_uri()
-                    })
-                }).collect();
+            let track = serde_json::json!({
+                "id": local_id,
+                "name": name,
+                "uri": uri_str,
+                "duration_ms": duration_secs * 1000,
+                "track_number": null,
+                "disc_number": null,
+                "artists": [{"id": "", "name": artist, "uri": ""}],
+                "album": {
+                    "id": "",
+                    "name": album,
+                    "uri": "",
+                    "images": [],
+                    "artists": []
+                },
+                "external_urls": {}
+            });
 
-                let album_artists: Vec<serde_json::Value> = sp_track.album.artists.iter().map(|a| {
-                    serde_json::json!({
-                        "id": a.id.to_id(),
-                        "name": a.name,
-                        "uri": a.id.to_uri()
-                    })
-                }).collect();
-
-                let track = serde_json::json!({
-                    "id": track_id,
-                    "name": sp_track.name,
-                    "uri": track_uri,
-                    "duration_ms": sp_track.duration,
-                    "track_number": sp_track.number,
-                    "disc_number": sp_track.disc_number,
-                    "artists": artists,
-                    "album": {
-                        "id": album_id,
-                        "name": sp_track.album.name,
-                        "uri": album_uri,
-                        "images": if cover_url.is_empty() {
-                            serde_json::json!([])
-                        } else {
-                            serde_json::json!([{"url": cover_url}])
-                        },
-                        "artists": album_artists
-                    },
-                    "external_urls": { "spotify": format!("https://open.spotify.com/track/{track_id}") }
-                });
-
-                items.push(serde_json::json!({
-                    "added_at": null,
-                    "track": track
-                }));
-            }
-            Err(e) => {
-                debug!("[spclient] SpTrack::get failed: {}", e);
-            }
+            items.push(serde_json::json!({
+                "added_at": null,
+                "track": track
+            }));
+            continue;
         }
+
+        let id = uri.to_id();
+
+        // Stub: only id and uri, rest is placeholder.
+        // Swift will fetch full metadata on demand via spotifly_get_track_metadata.
+        let track = serde_json::json!({
+            "id": id,
+            "name": "",
+            "uri": uri_str,
+            "duration_ms": 0,
+            "track_number": null,
+            "disc_number": null,
+            "artists": [{"id": "", "name": "", "uri": ""}],
+            "album": {
+                "id": "",
+                "name": "",
+                "uri": "",
+                "images": [],
+                "artists": []
+            },
+            "external_urls": { "spotify": format!("https://open.spotify.com/track/{id}") }
+        });
+
+        items.push(serde_json::json!({
+            "added_at": null,
+            "track": track
+        }));
     }
 
     let json = serde_json::json!({ "items": items });
     serde_json::to_string(&json).map_err(|e| e.to_string())
+}
+
+/// Fetches full metadata for a single track via SpTrack::get.
+/// Returns JSON string with track metadata, or null pointer on error.
+/// Called on demand by Swift as rows become visible during scrolling.
+async fn fetch_track_metadata(session: &Session, track_id: &str) -> Result<String, String> {
+    let track_uri = SpotifyUri::from_uri(&format!("spotify:track:{track_id}"))
+        .map_err(|e| format!("invalid track URI: {e}"))?;
+
+    let sp_track = SpTrack::get(session, &track_uri)
+        .await
+        .map_err(|e| format!("SpTrack::get failed: {e}"))?;
+
+    let id = sp_track.id.to_id();
+    let uri = sp_track.id.to_uri();
+
+    let cover_url = sp_track
+        .album
+        .covers
+        .first()
+        .map(|img| format!("https://i.scdn.co/image/{}", img.id.to_base16()))
+        .unwrap_or_default();
+
+    let album_id = sp_track.album.id.to_id();
+
+    let artists: Vec<serde_json::Value> = sp_track
+        .artists
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.to_id(),
+                "name": a.name,
+                "uri": a.id.to_uri()
+            })
+        })
+        .collect();
+
+    let album_artists: Vec<serde_json::Value> = sp_track
+        .album
+        .artists
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id.to_id(),
+                "name": a.name,
+                "uri": a.id.to_uri()
+            })
+        })
+        .collect();
+
+    let track = serde_json::json!({
+        "id": id,
+        "name": sp_track.name,
+        "uri": uri,
+        "duration_ms": sp_track.duration,
+        "track_number": sp_track.number,
+        "disc_number": sp_track.disc_number,
+        "artists": artists,
+        "album": {
+            "id": album_id,
+            "name": sp_track.album.name,
+            "uri": sp_track.album.id.to_uri(),
+            "images": if cover_url.is_empty() {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"url": cover_url}])
+            },
+            "artists": album_artists
+        },
+        "external_urls": { "spotify": format!("https://open.spotify.com/track/{id}") }
+    });
+
+    serde_json::to_string(&track).map_err(|e| e.to_string())
 }

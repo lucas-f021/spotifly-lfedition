@@ -113,6 +113,7 @@ struct FavoritesListView: View {
                 accessToken: token,
                 forceRefresh: forceRefresh,
             )
+            StoreCache.save(from: store)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -122,6 +123,7 @@ struct FavoritesListView: View {
         do {
             let token = await session.validAccessToken()
             try await trackService.loadMoreFavorites(accessToken: token)
+            StoreCache.save(from: store)
         } catch {
             errorMessage = error.localizedDescription
         }

@@ -22,11 +22,12 @@ enum SpotifyConfigError: Error, LocalizedError {
 }
 
 enum SpotifyConfig: Sendable {
-    /// Returns the Client ID from keychain
-    /// - Returns: The stored Client ID, or crashes if not set (should be set before login)
+    /// Returns the Client ID from keychain, or empty string if not configured.
+    /// Callers should handle empty string gracefully (API calls will fail with 401).
     nonisolated static func getClientId() -> String {
         guard let clientId = KeychainManager.loadCustomClientId(), !clientId.isEmpty else {
-            fatalError("Missing Spotify Client ID. Please enter your Client ID on the login screen.")
+            debugLog("SpotifyConfig", "No Client ID configured — login will fail")
+            return ""
         }
         return clientId
     }

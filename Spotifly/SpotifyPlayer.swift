@@ -212,7 +212,7 @@ private nonisolated func registerVolumeCallback() {
 /// C callback for volume change notifications from Rust
 private nonisolated func handleVolumeCallback(_ volume: UInt16) {
     debugLog("SpotifyPlayer", "Volume callback: \(volume)")
-    volumeSubject.send(volume)
+    DispatchQueue.main.async { volumeSubject.send(volume) }
 }
 
 /// Registers the loading callback with Rust (fires when a track starts loading)
@@ -246,7 +246,7 @@ private nonisolated func handleLoadingCallback(_ jsonPtr: UnsafePointer<CChar>?)
         let positionMs = (json["position_ms"] as? NSNumber)?.uint32Value ?? 0
 
         let notification = LoadingNotification(trackUri: trackUri, positionMs: positionMs)
-        loadingSubject.send(notification)
+        DispatchQueue.main.async { loadingSubject.send(notification) }
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse loading JSON: \(error)")
     }
@@ -296,7 +296,7 @@ private nonisolated func handleConnectionStateCallback(_ jsonPtr: UnsafePointer<
             connectedSinceMs: (json["connected_since_ms"] as? NSNumber)?.uint64Value,
         )
 
-        connectionStateSubject.send(state)
+        DispatchQueue.main.async { connectionStateSubject.send(state) }
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse connection state JSON: \(error)")
     }
@@ -324,7 +324,7 @@ private nonisolated func handleQueueChangedCallback(_ jsonPtr: UnsafePointer<CCh
 
         let trackUri = json["track_uri"] as? String ?? ""
         let notification = QueueChangedNotification(trackUri: trackUri)
-        queueChangedSubject.send(notification)
+        DispatchQueue.main.async { queueChangedSubject.send(notification) }
 
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse queue changed JSON: \(error)")
@@ -394,7 +394,7 @@ private nonisolated func handleSetQueueCallback(_ jsonPtr: UnsafePointer<CChar>?
             nextTracks: nextTracks,
             prevTracks: prevTracks,
         )
-        setQueueSubject.send(notification)
+        DispatchQueue.main.async { setQueueSubject.send(notification) }
 
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse set queue JSON: \(error)")
@@ -522,7 +522,7 @@ private nonisolated func handleSessionClientChangedCallback(_ jsonPtr: UnsafePoi
             "Session client: \(notification.clientName) (\(notification.clientBrandName) \(notification.clientModelName))",
         )
 
-        sessionClientChangedSubject.send(notification)
+        DispatchQueue.main.async { sessionClientChangedSubject.send(notification) }
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse session client changed JSON: \(error)")
     }
@@ -572,7 +572,7 @@ private nonisolated func handlePlaybackStateCallback(_ jsonPtr: UnsafePointer<CC
 
         debugLog("SpotifyPlayer", "PlaybackState: playing=\(state.isPlaying), paused=\(state.isPaused), pos=\(state.positionMs)ms, dur=\(state.durationMs)ms, shuffle=\(state.shuffle), repeatTrack=\(state.repeatTrack), repeatContext=\(state.repeatContext)")
 
-        playbackStateSubject.send(state)
+        DispatchQueue.main.async { playbackStateSubject.send(state) }
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse playback state JSON: \(error)")
         debugLog("SpotifyPlayer", "JSON preview: \(String(jsonString.prefix(500)))")
@@ -653,7 +653,7 @@ private nonisolated func handleQueueCallback(_ jsonPtr: UnsafePointer<CChar>?) {
         let prevCount = state.previousTracks?.count ?? 0
         debugLog("SpotifyPlayer", "handleQueueCallback: current='\(currentName)', next=\(nextCount), prev=\(prevCount)")
 
-        queueSubject.send(state)
+        DispatchQueue.main.async { queueSubject.send(state) }
     } catch {
         debugLog("SpotifyPlayer", "Failed to parse queue JSON: \(error)")
         debugLog("SpotifyPlayer", "JSON preview: \(String(jsonString.prefix(500)))")
@@ -869,6 +869,23 @@ enum SpotifyPlayer {
         let result = await Task.detached {
             uriOrUrl.withCString { ptr in
                 spotifly_play_uri(ptr, Int32(trackIndex))
+            }
+        }.value
+
+        guard result == 0 else {
+            throw SpotifyPlayerError.playbackFailed
+        }
+    }
+
+    /// Plays a context (playlist/album) starting at a specific track identified by URI.
+    /// Use this instead of play(uriOrUrl:trackIndex:) to avoid index drift caused by
+    /// local files interspersed in the context.
+    static func playContext(_ contextUri: String, trackUri: String) async throws {
+        let result = await Task.detached {
+            contextUri.withCString { ctxPtr in
+                trackUri.withCString { trkPtr in
+                    spotifly_play_context_with_track(ctxPtr, trkPtr)
+                }
             }
         }.value
 

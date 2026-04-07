@@ -11,7 +11,7 @@ import Foundation
 
 // MARK: - Cache Limits
 
-private let maxCacheBytes = 4 * 1024 * 1024 // 4MB
+private let maxCacheBytes = 10 * 1024 * 1024 // 10MB
 
 // MARK: - Cache File Location
 
@@ -137,6 +137,17 @@ enum StoreCache {
 
         guard let url = cacheFileURL else { return }
 
+        // Safety: never overwrite a non-empty cache with a smaller one.
+        // Prevents accidental data loss from race conditions during startup.
+        let newTrackCount = store.cachedTracks.count
+        if let existingData = try? Data(contentsOf: url),
+           let existing = try? JSONDecoder().decode(CacheSnapshot.self, from: existingData),
+           let existingTracks = existing.tracks?.data,
+           existingTracks.count > newTrackCount + 10 {
+            debugLog("StoreCache", "Skipping save: existing cache has \(existingTracks.count) tracks, new only has \(newTrackCount) — refusing to shrink")
+            return
+        }
+
         do {
             // Ensure Spotifly/ directory exists
             try FileManager.default.createDirectory(
@@ -145,7 +156,7 @@ enum StoreCache {
             )
             var encoded = try JSONEncoder().encode(snapshot)
 
-            // If over 4MB, evict browse-only data and re-encode
+            // If over cap, evict browse-only data and re-encode
             if encoded.count > maxCacheBytes {
                 let beforeKB = encoded.count / 1024
                 let trimmed = snapshot.evictBrowseCache()
@@ -154,7 +165,7 @@ enum StoreCache {
             }
 
             try encoded.write(to: url, options: .atomic)
-            debugLog("StoreCache", "Saved cache (\(encoded.count / 1024)KB) to \(url.lastPathComponent)")
+            debugLog("StoreCache", "Saved cache (\(encoded.count / 1024)KB, \(newTrackCount) tracks) to \(url.lastPathComponent)")
         } catch {
             debugLog("StoreCache", "Save failed: \(error)")
         }
@@ -176,9 +187,14 @@ enum StoreCache {
             debugLog("StoreCache", "Loaded cache from disk (\(data.count / 1024)KB)")
             return snapshot
         } catch {
-            debugLog("StoreCache", "Cache decode failed (will re-fetch): \(error)")
-            // Delete corrupt cache
-            try? FileManager.default.removeItem(at: url)
+            debugLog("StoreCache", "Cache decode failed: \(error)")
+            // Back up the file instead of deleting — allows recovery/debugging.
+            if let backup = url.deletingLastPathComponent()
+                .appendingPathComponent("spotifly_store_cache.corrupt.json") as URL? {
+                try? FileManager.default.removeItem(at: backup)
+                try? FileManager.default.moveItem(at: url, to: backup)
+                debugLog("StoreCache", "Backed up corrupt cache to \(backup.lastPathComponent)")
+            }
             return nil
         }
     }

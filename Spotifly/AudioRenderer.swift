@@ -6,6 +6,7 @@
 //  Audio data flows: Rust FFI callback -> ring buffer -> AVSampleBufferAudioRenderer -> AirPlay/speakers
 //
 
+import Accelerate
 import AVFoundation
 import CoreMedia
 
@@ -25,8 +26,9 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
     /// Ring buffer capacity in f32 samples (~1 second of stereo audio)
     private static let ringBufferCapacity = 88_200 // 44100 * 2ch * 1s
 
-    /// Chunk size for feeding renderer (~1024 frames = 2048 stereo samples)
-    private static let feedChunkSamples = 2048
+    /// Chunk size for feeding renderer (~4096 frames = 8192 stereo samples)
+    /// Larger chunks = fewer callbacks = less lock contention and overhead
+    private static let feedChunkSamples = 8192
 
     // MARK: - AVFoundation Objects (recreated on output device change)
 
@@ -79,7 +81,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
 
     // MARK: - Audio Format (cached)
 
-    private let formatDescription: CMAudioFormatDescription
+    private let formatDescription: CMAudioFormatDescription?
 
     // MARK: - Init
 
@@ -110,10 +112,12 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             extensions: nil,
             formatDescriptionOut: &desc,
         )
-        guard status == noErr, let formatDesc = desc else {
-            fatalError("AudioRenderer: Failed to create audio format description: \(status)")
+        if status == noErr, let formatDesc = desc {
+            formatDescription = formatDesc
+        } else {
+            debugLog("AudioRenderer", "Failed to create audio format description: \(status) — audio disabled")
+            formatDescription = nil
         }
-        formatDescription = formatDesc
         synchronizer.addRenderer(renderer)
 
         // Recover from output device changes (AirPlay ↔ local speaker)
@@ -223,6 +227,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
     }
 
     private func feedRenderer() {
+        guard formatDescription != nil else { return }
         while renderer.isReadyForMoreMediaData {
             // Read a chunk from ring buffer
             bufferLock.lock()
@@ -263,12 +268,11 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
                 spaceAvailable.signal()
             }
 
-            // Apply volume scaling to this chunk
+            // Apply volume scaling to this chunk (hardware-accelerated)
             let ptr = chunk.assumingMemoryBound(to: Float.self)
             if vol < 0.9999 {
-                for i in 0 ..< toRead {
-                    ptr[i] *= vol
-                }
+                var volume = vol
+                vDSP_vsmul(ptr, 1, &volume, ptr, 1, vDSP_Length(toRead))
             }
 
             // Apply EQ (after volume, before enqueue)
@@ -302,7 +306,7 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
             status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
                 allocator: kCFAllocatorDefault,
                 dataBuffer: block,
-                formatDescription: formatDescription,
+                formatDescription: formatDescription!,
                 sampleCount: frameCount,
                 presentationTimeStamp: currentPTS,
                 packetDescriptions: nil,
@@ -340,15 +344,18 @@ final nonisolated class AudioRenderer: @unchecked Sendable {
         bufferLock.lock()
         let old = currentVolume
         currentVolume = clamped
-        // Rescale buffered samples from old volume to new volume in-place.
+        // Rescale buffered samples from old volume to new volume in-place (hardware-accelerated).
         if old > 0.0001 {
-            let scale = clamped / old
-            var idx = readIndex
-            var remaining = availableSamples
-            while remaining > 0 {
-                ringBuffer[idx] *= scale
-                idx = (idx + 1) % Self.ringBufferCapacity
-                remaining -= 1
+            var scale = clamped / old
+            let count = availableSamples
+            let firstChunk = min(count, Self.ringBufferCapacity - readIndex)
+            if firstChunk > 0 {
+                vDSP_vsmul(ringBuffer.advanced(by: readIndex), 1, &scale,
+                           ringBuffer.advanced(by: readIndex), 1, vDSP_Length(firstChunk))
+            }
+            let secondChunk = count - firstChunk
+            if secondChunk > 0 {
+                vDSP_vsmul(ringBuffer, 1, &scale, ringBuffer, 1, vDSP_Length(secondChunk))
             }
         }
         let rendering = isRendering
