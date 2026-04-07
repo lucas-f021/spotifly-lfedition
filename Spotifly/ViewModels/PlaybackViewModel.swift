@@ -57,6 +57,11 @@ final class PlaybackViewModel {
     var currentTrackUri: String?
     var errorMessage: String?
 
+    /// In-flight guard for play/pause toggle. Prevents rapid clicks from firing
+    /// duplicate Web API calls while a previous toggle hasn't yet been confirmed
+    /// by Mercury or HTTP response.
+    @ObservationIgnored private var isTogglingPlayback = false
+
     /// Whether the currently playing track is a local file (not Spirc)
     private(set) var isPlayingLocalFile = false
 
@@ -436,6 +441,7 @@ final class PlaybackViewModel {
     }
 
     func pause() {
+        guard !isTogglingPlayback else { return }
         if isPlayingLocalFile {
             LocalAudioPlayer.shared.pause()
             isPlaying = false
@@ -447,22 +453,28 @@ final class PlaybackViewModel {
                 debugLog("PlaybackViewModel", "pause() ignored - session not connected yet")
                 return
             }
+            isPlaying = false // optimistic; Mercury will confirm
             SpotifyPlayer.pause()
         } else {
-            // Remote control via Web API
+            // Remote control via Web API. Optimistic update + in-flight guard
+            // so the button toggles immediately and rapid clicks don't spam.
+            isTogglingPlayback = true
+            isPlaying = false
             Task {
+                defer { isTogglingPlayback = false }
                 guard let token = await tokenProvider?() else { return }
                 do {
                     try await SpotifyAPI.pausePlayback(accessToken: token)
                 } catch {
+                    isPlaying = true // revert
                     errorMessage = error.localizedDescription
                 }
             }
         }
-        // State update will come from Mercury callback
     }
 
     func resume() {
+        guard !isTogglingPlayback else { return }
         if isPlayingLocalFile {
             LocalAudioPlayer.shared.resume()
             isPlaying = true
@@ -476,22 +488,41 @@ final class PlaybackViewModel {
                 debugLog("PlaybackViewModel", "resume() ignored - session not connected yet")
                 return
             }
+            isPlaying = true // optimistic
             SpotifyPlayer.resume()
-        } else {
-            // Remote control via Web API
+            // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume.
+            // Keep the current positionAnchorMs (correct from paused state), just update the time.
+            positionAnchorTime = CACurrentMediaTime()
+            updateNowPlayingPosition()
+        } else if SpotifyPlayer.isSpircReady {
+            // Spotifly is initialized but inactive (e.g. another device took over,
+            // or this is a cold start with no active device). Pull playback here
+            // via Spirc's native transfer instead of firing Web API resume into
+            // a phantom device — that path 404s when no active device exists.
+            isTogglingPlayback = true
+            isPlaying = true // optimistic
+            SpotifyPlayer.transferToLocal()
+            // Mercury will fire a TrackChanged + PlaybackState callback once
+            // the transfer completes; clear the guard then via a brief debounce.
             Task {
+                try? await Task.sleep(for: .seconds(2))
+                isTogglingPlayback = false
+            }
+        } else {
+            // True remote control fallback — Spirc isn't even initialized.
+            isTogglingPlayback = true
+            isPlaying = true
+            Task {
+                defer { isTogglingPlayback = false }
                 guard let token = await tokenProvider?() else { return }
                 do {
                     try await SpotifyAPI.resumePlayback(accessToken: token)
                 } catch {
+                    isPlaying = false // revert
                     errorMessage = error.localizedDescription
                 }
             }
         }
-        // Don't call syncPositionAnchor() - Rust returns 0 immediately after resume
-        // Keep the current positionAnchorMs (correct from paused state), just update the time
-        positionAnchorTime = CACurrentMediaTime()
-        updateNowPlayingPosition()
     }
 
     func toggleShuffle() {
