@@ -712,6 +712,21 @@ fn spawn_cluster_listener(session: &Session, generation: u64) -> Result<(), Stri
             match msg_result {
                 Ok(cluster_update) => {
                     if let Some(cluster) = cluster_update.cluster.into_option() {
+                        // Update IS_ACTIVE_DEVICE based on whether the cluster's
+                        // active device matches us. This is what lets remote
+                        // controllers (e.g. the phone) hand control back to us
+                        // without requiring a player event to fire first.
+                        let our_device_id = DEVICE_ID.lock().unwrap().clone();
+                        if let Some(our_id) = our_device_id {
+                            let we_are_active = cluster.active_device_id == our_id;
+                            let was_active = IS_ACTIVE_DEVICE.swap(we_are_active, Ordering::SeqCst);
+                            if was_active != we_are_active {
+                                debug!(
+                                    "Cluster update: active device {} (was_active={} → {})",
+                                    cluster.active_device_id, was_active, we_are_active
+                                );
+                            }
+                        }
                         notify_active_device_id(&cluster.active_device_id);
                         if let Some(player_state) = cluster.player_state.into_option() {
                             send_playback_state(&player_state);
@@ -1503,6 +1518,32 @@ async fn init_player_async(access_token: &str, activate_after_connect: bool) -> 
                             if my_gen != current_gen {
                                 debug!("[WAKE +{}ms] SessionDisconnected from old generation {} (current={}), ignoring",
                                        elapsed_since_wake_ms(), my_gen, current_gen);
+                                continue;
+                            }
+
+                            // Distinguish a *handoff* (another client took over via
+                            // Spotify Connect) from a real network disconnect.
+                            // Heuristic: if a recent cluster update told us the
+                            // active device is something other than us, this
+                            // SessionDisconnected is just Spotify rotating our
+                            // connection_id as part of the takeover. Stay alive
+                            // so the remote client can still see + control us.
+                            let our_device_id = DEVICE_ID.lock().unwrap().clone().unwrap_or_default();
+                            let last_active = LAST_ACTIVE_DEVICE_ID.lock().unwrap().clone();
+                            let is_handoff = !last_active.is_empty()
+                                && last_active != our_device_id;
+
+                            if is_handoff {
+                                debug!(
+                                    "[WAKE +{}ms] SessionDisconnected is a handoff to '{}' — keeping Spirc alive",
+                                    elapsed_since_wake_ms(), last_active
+                                );
+                                IS_ACTIVE_DEVICE.store(false, Ordering::SeqCst);
+                                IS_PLAYING.store(false, Ordering::SeqCst);
+                                // Don't mark_disconnected — Spirc/Session are still
+                                // valid, the dealer keeps streaming cluster updates,
+                                // and we remain visible in remote device pickers.
+                                notify_connection_state_change();
                                 continue;
                             }
 
