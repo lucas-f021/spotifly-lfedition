@@ -92,9 +92,11 @@ final class QueueService {
 
         store.setQueue(previous: prevEntries, current: currentEntry, next: nextEntries, contextUri: notification.contextUri)
 
-        // Queue display uses QueueItem data from Spirc (name, artist, image already included).
-        // Skip metadata fetch to avoid burning API quota — tracks get cached when
-        // the user opens the playlist/album instead.
+        // Only fetch the CURRENT track's metadata (needed for Now Playing bar).
+        // Queue view uses QueueItem data from Spirc directly.
+        if let trackId = currentEntry?.trackId {
+            fetchTrackMetadata(for: [trackId])
+        }
         updateNowPlayingMetadata()
     }
 
@@ -144,7 +146,10 @@ final class QueueService {
             cancelPendingQueueRefresh()
         }
 
-        // Queue display uses QueueItem data from Spirc — skip metadata fetch.
+        // Only fetch the CURRENT track's metadata (for Now Playing bar).
+        if let trackId = currentEntry?.trackId {
+            fetchTrackMetadata(for: [trackId])
+        }
         updateNowPlayingMetadata()
     }
 
@@ -210,7 +215,7 @@ final class QueueService {
 
         debugLog("QueueService", "Fetching \(stillNeeded.count) tracks via spclient (rate-limited)")
 
-        metadataFetchTask = Task { [weak self] in
+        metadataFetchTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
             for trackId in stillNeeded {
@@ -275,7 +280,10 @@ final class QueueService {
 
             debugLog("QueueService", "Initial queue: current=\(currentEntry != nil ? 1 : 0), next=\(nextEntries.count)")
 
-            // Skip bulk metadata fetch — queue view uses QueueItem data directly.
+            // Only fetch current track metadata for Now Playing bar.
+            if let trackId = currentEntry?.trackId {
+                fetchTrackMetadata(for: [trackId])
+            }
             updateNowPlayingMetadata()
 
             // Process playback state if available

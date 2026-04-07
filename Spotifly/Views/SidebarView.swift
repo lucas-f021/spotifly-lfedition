@@ -165,13 +165,6 @@ struct SidebarView: View {
 struct RateLimiterStatusView: View {
     @State private var snap = RateLimiterSnapshot(requestsInWindow: 0, maxRequests: 27, windowSeconds: 30, oldestRequestAge: nil, newestRequestAge: nil, waitingCount: 0)
 
-    /// Seconds until the oldest request exits the window (next slot frees up)
-    private var resetIn: Double? {
-        guard let age = snap.oldestRequestAge else { return nil }
-        let remaining = snap.windowSeconds - age
-        return remaining > 0 ? remaining : nil
-    }
-
     private var usageColor: Color {
         let ratio = Double(snap.requestsInWindow) / Double(snap.maxRequests)
         if ratio >= 0.8 { return .red }
@@ -215,8 +208,8 @@ struct RateLimiterStatusView: View {
                 if snap.waitingCount > 0 {
                     Text("\(snap.waitingCount) queued")
                         .foregroundStyle(.orange)
-                } else if let secs = resetIn, snap.requestsInWindow > 0 {
-                    Text("reset \(Int(secs))s")
+                } else {
+                    Text("30s")
                         .foregroundStyle(.tertiary)
                 }
             }

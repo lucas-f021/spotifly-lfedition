@@ -275,6 +275,32 @@ struct PlaylistDetailView: View {
         }
     }
 
+    /// True when this playlist is pinned AND all its tracks are actually loaded.
+    private var isFullyCached: Bool {
+        guard isCached else { return false }
+        let stubCount = tracks.filter { $0.isStub }.count
+        return stubCount == 0
+    }
+
+    private var cacheButtonLabel: String {
+        if !isCached { return "Cache Playlist" }
+        if cacheProgress != nil { return "Caching..." }
+        if isFullyCached { return "Cached" }
+        return "Re-cache"
+    }
+
+    private var cacheButtonIcon: String {
+        if !isCached { return "arrow.down.circle" }
+        if isFullyCached { return "arrow.down.circle.fill" }
+        return "arrow.clockwise.circle"
+    }
+
+    private var cacheButtonTint: Color {
+        if !isCached { return .secondary }
+        if isFullyCached { return .green }
+        return .orange
+    }
+
     private func playlistActions() -> some View {
         VStack(spacing: 12) {
             Button {
@@ -294,13 +320,13 @@ struct PlaylistDetailView: View {
                     toggleCached()
                 } label: {
                     Label(
-                        isCached ? "Cached" : "Cache Playlist",
-                        systemImage: isCached ? "arrow.down.circle.fill" : "arrow.down.circle"
+                        cacheButtonLabel,
+                        systemImage: cacheButtonIcon
                     )
                     .font(.subheadline)
                 }
                 .buttonStyle(.bordered)
-                .tint(isCached ? .green : .secondary)
+                .tint(cacheButtonTint)
             }
 
             if let progress = cacheProgress {
