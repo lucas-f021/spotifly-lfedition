@@ -348,7 +348,12 @@ struct ArtistDetailView: View {
 
         let token = await session.validAccessToken()
         do {
-            let artistEntity = try await artistService.fetchArtistDetails(
+            // getArtist returns the cached entity if present, only firing
+            // GET /artists/{id} on a true cache miss. This skips one of the
+            // four requests fired on every artist page visit when the user
+            // is navigating from a track / search result / followed artists
+            // list (i.e. almost always).
+            let artistEntity = try await artistService.getArtist(
                 artistId: artistId,
                 accessToken: token,
             )
