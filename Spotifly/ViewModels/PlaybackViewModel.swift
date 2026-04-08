@@ -52,6 +52,9 @@ final class PlaybackViewModel {
     /// Reference to AppStore for reading current track metadata (set by LoggedInView)
     private weak var store: AppStore?
 
+    /// Reference to QueueService for timing instrumentation (set by LoggedInView)
+    @ObservationIgnored private weak var queueService: QueueService?
+
     var isPlaying = false
     var isLoading = false
     var currentTrackUri: String?
@@ -205,6 +208,7 @@ final class PlaybackViewModel {
         isLoading = true
         errorMessage = nil
 
+        queueService?.markPlayRequested()
         do {
             try await SpotifyPlayer.play(uriOrUrl: uriOrUrl, trackIndex: trackIndex)
             handlePlaybackStarted(trackId: uriOrUrl)
@@ -370,6 +374,11 @@ final class PlaybackViewModel {
     /// Sets the AppStore reference. Call this after AppStore is created.
     func setStore(_ store: AppStore) {
         self.store = store
+    }
+
+    /// Sets the QueueService reference for timing instrumentation.
+    func setQueueService(_ queueService: QueueService) {
+        self.queueService = queueService
     }
 
     // MARK: - Playback Control (via Spirc or Web API)

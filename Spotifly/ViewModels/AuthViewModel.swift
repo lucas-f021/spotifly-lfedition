@@ -65,6 +65,9 @@ final class AuthViewModel {
     func logout() {
         SpotifyAuth.clearAuthResult()
         KeychainManager.clearAuthResult()
+        // Clear cached Premium verification — a different account on next login
+        // needs to be re-checked.
+        UserDefaults.standard.removeObject(forKey: "premiumVerified")
         authResult = nil
     }
 }

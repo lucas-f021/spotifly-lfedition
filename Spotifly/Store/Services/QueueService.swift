@@ -9,6 +9,7 @@
 
 import Combine
 import Foundation
+import QuartzCore
 
 @MainActor
 @Observable
@@ -24,6 +25,24 @@ final class QueueService {
     private let fetchSubject = PassthroughSubject<Void, Never>()
     /// Subscription for debounced fetch operations
     private var fetchDebounceSubscription: AnyCancellable?
+    /// Timestamp (CACurrentMediaTime) of the most recent play() call.
+    /// Used to log latency of Mercury queue updates vs the Web API fallback.
+    private var lastPlayTimestamp: CFTimeInterval?
+
+    /// Mark the moment a play() request was issued. Used by the sessionConnected
+    /// handler to suppress redundant Web API state fetches that fire when our
+    /// own play() rotates the dealer connection_id (the active-device transition
+    /// isn't a real reconnect).
+    func markPlayRequested() {
+        lastPlayTimestamp = CACurrentMediaTime()
+    }
+
+    /// Returns true if play() was called within the given window. Used to
+    /// distinguish a real session reconnect from our own active-device handoff.
+    func wasPlayRequestedWithin(seconds: Double) -> Bool {
+        guard let start = lastPlayTimestamp else { return false }
+        return (CACurrentMediaTime() - start) < seconds
+    }
 
     init(store: AppStore, tokenProvider: @escaping () async -> String) {
         self.store = store

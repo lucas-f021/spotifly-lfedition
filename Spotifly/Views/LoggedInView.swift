@@ -71,6 +71,7 @@ struct LoggedInView: View {
 
         // Give PlaybackViewModel access to AppStore for reading current track metadata
         playbackViewModel.setStore(store)
+        playbackViewModel.setQueueService(_queueService.wrappedValue)
     }
 
     private let reconnectWatchdogTimeoutSeconds: Double = 120
@@ -188,13 +189,18 @@ struct LoggedInView: View {
 
             // Require Spotify Premium (librespot only works with Premium accounts).
             // The product field was removed from /me, so we probe a premium-only endpoint.
-            do {
-                _ = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
-            } catch SpotifyAPIError.forbidden {
-                blockingState = .premiumRequired
-                return
-            } catch {
-                // Network/other errors - don't block startup, playback will fail later if not premium
+            // Skip the probe entirely if we already verified Premium on a previous launch
+            // — Premium status doesn't change often and the user can re-verify by logging out.
+            if !UserDefaults.standard.bool(forKey: "premiumVerified") {
+                do {
+                    _ = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
+                    UserDefaults.standard.set(true, forKey: "premiumVerified")
+                } catch SpotifyAPIError.forbidden {
+                    blockingState = .premiumRequired
+                    return
+                } catch {
+                    // Network/other errors - don't block startup, playback will fail later if not premium
+                }
             }
 
             // Load favorites so heart indicators work everywhere
@@ -230,6 +236,17 @@ struct LoggedInView: View {
             // After a transfer the Web API returns stale data for a few seconds,
             // so we delay the fetch to let the server catch up.
             // Device active state is now updated via the cluster callback, no HTTP needed here.
+            //
+            // Skip the refresh if we just called play() — Spotify rotates the dealer
+            // connection_id when an inactive device becomes active, which fires
+            // SessionConnected but isn't a *real* reconnect. Our own play() will
+            // populate state via the upcoming SetQueue / Mercury callbacks; firing
+            // /me/player + /me/player/queue here just spends rate limit on data
+            // we're about to receive over Spirc anyway.
+            if queueService.wasPlayRequestedWithin(seconds: 3) {
+                debugLog("LoggedInView", "Skipping sessionConnected refresh — recent play() in flight")
+                return
+            }
             Task {
                 let token = await session.validAccessToken()
                 await deviceService.waitForTransferSettling()
